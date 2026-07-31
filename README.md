@@ -97,10 +97,51 @@ knowing when running against a reasoning model:
  * **A batch waits for its slowest sample.** Runaway traces, not the number of
    agents, set the wall clock, which is the other reason to bound the thinking.
    `timeout` bounds the request as a whole.
- - [ ] Evaluator
+ - [x] Evaluator
    - Score a model
- - [ ] Reporting
-   - csv of model, scores, diagnostics
+
+An evaluator answers one question about one model and says so in numbers: a
+dictionary of scalars or vectors, named. `Diagnostics` is an evaluator that may
+also return an `Artifact` — a posterior predictive plot, a trace — alongside its
+numbers, in the same call and the same pass over the model.
+
+```python
+class Likelihood(Evaluator):
+    async def score(self, model: Model) -> dict:
+        return {"loglik": await sandbox.run(model), "folds": [...]}
+
+class Posterior(Diagnostics):
+    async def score(self, model: Model) -> dict:
+        fit = await sandbox.run(model)
+        return {"rhat": fit.rhat, "trace": Artifact("trace", fit.png)}
+
+evaluations = await evaluate(
+    models(proposals), [Likelihood(), Posterior()], concurrency=8, timeout=120.0
+)
+```
+
+The unit of work is one evaluator on one model, and `concurrency` bounds how
+many of those are in flight, since the sandbox rather than the event loop is the
+scarce thing. One failure costs one result: an evaluator that raises, times out,
+or hands back something that is not a number becomes a `Result` carrying the
+exception, and the rest of the batch is unaffected. Evaluations keep the order
+of the models and results the order of the evaluators, so a report reads the
+same way twice.
+
+ - [x] Reporting
+   - jsonl of model, scores, diagnostics
+
+```python
+write(evaluations, "runs/007/report.jsonl", append=True)
+```
+
+One line per model, holding the model source, the metrics grouped by the
+evaluator that produced them, and any errors. Jsonl because a record is
+naturally nested — a vector is a list — and because a line is complete on its
+own: a search can append each round as it finishes, and `read` skips a
+truncated tail, so the report of a run that died halfway is still a report.
+Images are the one thing that does not fit on a line; they are written to
+`artifacts/` beside the report and the record points at them.
  - [ ] Sandbox for model generator
  - [ ] SMC Search
    - N particles
