@@ -1,0 +1,17 @@
+[project]
+name = "discovery"
+version = "0.1.0"
+description = "Harness for model discovery"
+readme = "README.md"
+authors = [
+    { name = "Giovanni", email = "giovanni.charles@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+discovery = "discovery:main"
+
+[build-system]
+requires = ["uv_build>=0.11.26,<0.12.0"]
+build-backend = "uv_build"
