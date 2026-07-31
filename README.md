@@ -21,9 +21,27 @@ To get started specify:
 
 # Roadmap
 
- - [ ] Model proposer
+ - [x] Model proposer
    - Stores model url and transcript
    - Creates prompt
+
+A model is a program. Regions the search may rewrite are delimited by marker
+comments; everything else is fixed scaffolding that the proposer may not touch:
+
+```python
+def dv_dt(x, t, v, params):
+    # @discovery:begin dynamics
+    return params["F0"] * np.sin(t) - params["beta"] * v
+    # @discovery:end
+```
+
+The proposer sends the program and any feedback, then splices the returned
+blocks back in by name:
+
+```python
+proposer = ModelProposer(url="http://host:8000/v1", llm_model="Qwen/Qwen3.5-35B-A3B-FP8")
+proposed = proposer.propose(Model(source), feedback="log likelihood: -1843.2")
+```
  - [ ] I.I.D. Search
    - N agents
  - [ ] Evaluator
@@ -36,32 +54,3 @@ To get started specify:
  - [ ] Islands Search
    - N islands
    - N agents
-
-# Example for tests
-
-symbols:
-[
-  "dv_dt",
-  "x",
-  "t",
-  "v"
-]
-
-symbol descriptions:
-[
-  "Acceleration in Nonl-linear Harmonic Oscillator",
-  "Position at time t",
-  "Time",
-  "Velocity at time t"
-]
-
-symbol properties (O -> "operator/constant", V -> "variable"):
-[
-  "O",
-  "V",
-  "V",
-  "V"
-]
-
-expression:
-F0*sin(t) - beta*sin(v(t)) - omega0**2*x(t)**3 - omega0**2*x(t)*exp(-Abs(x(t)))
