@@ -142,9 +142,27 @@ own: a search can append each round as it finishes, and `read` skips a
 truncated tail, so the report of a run that died halfway is still a report.
 Images are the one thing that does not fit on a line; they are written to
 `artifacts/` beside the report and the record points at them.
+ - [ ] Add context for proposers
  - [ ] Sandbox for model generator
  - [ ] SMC Search
    - N particles
  - [ ] Islands Search
    - N islands
    - N agents
+
+# Examples
+
+`examples/` runs the whole loop against real data; see `examples/README.md`.
+
+```sh
+uv sync --group examples
+uv run python -m examples.birthdates --url http://host:8000/v1 --agents 8
+```
+
+`birthdates` searches for the process behind twenty years of daily birth counts,
+holding the observational likelihood fixed outside the rewritable region and
+scoring every proposal on one NUTS fit with a constant budget: identifiability,
+held-out likelihood, coverage, R-hat, tail-ESS and the cost of the fit, with a
+posterior predictive check and a calibration plot. Until the sandbox above
+exists, the example carries its own -- each fit is a child process, so a model
+that hangs or crashes costs one result.

@@ -61,6 +61,19 @@ def test_substitute_handles_multi_line_bodies():
     assert new.blocks[0].body == "    a = 1\n    b = 2\n    slope = a + b"
 
 
+def test_substitute_indents_a_body_written_flush_left():
+    # what a model actually returns: the region on its own, at column zero
+    new = Model(SOURCE).substitute({"prior": 'slope = sample("slope", Cauchy(0.0, 1.0))'})
+    assert '    slope = sample("slope", Cauchy(0.0, 1.0))' in new.source
+    assert compile(new.source, "<test>", "exec")
+
+
+def test_substitute_keeps_shape_within_an_indented_body():
+    new = Model(SOURCE).substitute({"prior": "if True:\n    slope = 1.0\n\nelse:\n    slope = 2.0"})
+    assert new.blocks[0].body == "    if True:\n        slope = 1.0\n\n    else:\n        slope = 2.0"
+    assert compile(new.source, "<test>", "exec")
+
+
 def test_substitute_rejects_unknown_blocks():
     with pytest.raises(KeyError, match="nonsense"):
         Model(SOURCE).substitute({"nonsense": "x = 1"})

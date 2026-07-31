@@ -13,11 +13,26 @@ what a proposer may replace.
 """
 
 import re
+import textwrap
 from dataclasses import dataclass, replace
 
 BEGIN = re.compile(r"^(?P<indent>[ \t]*)#\s*@discovery:begin(?:\s+(?P<name>\S+))?\s*$")
 END = re.compile(r"^[ \t]*#\s*@discovery:end\s*$")
 FENCE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+
+
+def reindent(body: str, indent: str) -> str:
+    """Set a body's indentation to `indent`, keeping its shape inside.
+
+    Where a block sits in the file is the scaffolding's business and not the
+    proposer's: the begin marker states the indentation, and a body that arrives
+    flush left -- as one written on its own, away from the function it belongs
+    to, naturally does -- is put back where the block was. Relative indentation
+    within the body is untouched, and a body that already matches comes back
+    unchanged.
+    """
+    lines = textwrap.dedent(body).splitlines()
+    return "\n".join(f"{indent}{line}" if line.strip() else "" for line in lines)
 
 
 @dataclass(frozen=True)
@@ -65,7 +80,9 @@ class Model:
     def substitute(self, bodies: dict[str, str]) -> "Model":
         """Return a copy with the named blocks' bodies replaced.
 
-        Unknown names are an error; blocks left unmentioned are kept as they are.
+        Unknown names are an error; blocks left unmentioned are kept as they
+        are. Each new body is put at its block's indentation, so a proposal
+        written flush left still splices into an indented block.
         """
         known = {block.name for block in self.blocks}
         if unknown := set(bodies) - known:
@@ -81,7 +98,7 @@ class Model:
                 seen += 1
                 out.append(line)
                 if replacing := name in bodies:
-                    out.append(bodies[name])
+                    out.append(reindent(bodies[name], begin["indent"]))
             elif replacing and END.match(line):
                 replacing = False
                 out.append(line)

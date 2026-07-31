@@ -23,6 +23,12 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=1.0",
 ]
+examples = [
+    "numpyro>=0.21",
+    "jax>=0.7",
+    "arviz-stats>=1.2",
+    "matplotlib>=3.10",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
