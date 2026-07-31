@@ -1,7 +1,13 @@
-"""Proposes new models by asking an LLM to rewrite a model's marked blocks."""
+"""Proposes new models by asking an LLM to rewrite a model's marked blocks.
+
+The client is asynchronous: a search runs many proposers at once, and they
+spend nearly all of their time waiting on the inference server.
+"""
 
 from dataclasses import dataclass, field
 from typing import Any
+
+from openai import AsyncOpenAI
 
 from discovery.model import Model, parse_blocks
 
@@ -21,12 +27,47 @@ term or structure, not a cosmetic edit.\
 """
 
 
+class ProposalError(ValueError):
+    """A reply that could not be turned into a model.
+
+    Carries the reply itself, so a failed agent can be inspected rather than
+    just counted.
+    """
+
+    def __init__(self, message: str, reply: str = "", finish_reason: str | None = None) -> None:
+        super().__init__(message)
+        self.reply = reply
+        self.finish_reason = finish_reason
+
+
+def splice(model: Model, reply: str, finish_reason: str | None = None) -> Model:
+    """Turn one reply into a model, or say why it cannot be.
+
+    Shared by the single proposal and by each sample of a batch: the two differ
+    in how they ask, not in how a reply is read.
+    """
+    bodies = parse_blocks(reply)
+    if not bodies:
+        # A reasoning model can spend its whole budget thinking and return
+        # nothing at all, which is a decode setting to fix, not a bad reply.
+        if finish_reason == "length":
+            raise ProposalError(
+                "reply hit max_tokens before any @discovery blocks; raise max_tokens",
+                reply,
+                finish_reason,
+            )
+        raise ProposalError("proposal contained no @discovery blocks", reply, finish_reason)
+    return model.substitute(bodies)
+
+
 @dataclass
 class ModelProposer:
     """Stores the LLM url and the transcript, and creates the prompt.
 
     The transcript is the running conversation: it is what makes successive
-    proposals aware of what has already been tried and how it scored.
+    proposals aware of what has already been tried and how it scored. Only a
+    search that chains exercises it -- an i.i.d. search uses each proposer for
+    exactly one call, so every draw starts from the system prompt alone.
     """
 
     url: str
@@ -39,13 +80,12 @@ class ModelProposer:
 
     def __post_init__(self) -> None:
         if self.client is None:
-            from openai import OpenAI
-
-            self.client = OpenAI(base_url=self.url, api_key=self.api_key)
+            self.client = AsyncOpenAI(base_url=self.url, api_key=self.api_key)
         if not self.transcript:
             self.transcript.append({"role": "system", "content": self.system_prompt})
 
-    def prompt(self, model: Model, feedback: str | None = None) -> str:
+    @staticmethod
+    def prompt(model: Model, feedback: str | None = None) -> str:
         """The user turn describing the model to improve."""
         names = ", ".join(block.name for block in model.blocks) or "(none)"
         parts = [
@@ -60,22 +100,27 @@ class ModelProposer:
         parts += ["", "Propose an improved version of the rewritable regions."]
         return "\n".join(parts)
 
-    def propose(self, model: Model, feedback: str | None = None, **kwargs: Any) -> Model:
-        """Ask for one new model, appending both turns to the transcript."""
-        self.transcript.append({"role": "user", "content": self.prompt(model, feedback)})
-        response = self.client.chat.completions.create(
-            model=self.llm_model,
-            messages=list(self.transcript),
-            temperature=self.temperature,
-            **kwargs,
-        )
-        reply = response.choices[0].message.content or ""
-        self.transcript.append({"role": "assistant", "content": reply})
+    async def propose(self, model: Model, feedback: str | None = None, **kwargs: Any) -> Model:
+        """Ask for one new model, appending both turns to the transcript.
 
-        bodies = parse_blocks(reply)
-        if not bodies:
-            raise ValueError("proposal contained no @discovery blocks")
-        return model.substitute(bodies)
+        Sampling settings given here override this proposer's defaults.
+        """
+        settings: dict[str, Any] = {"temperature": self.temperature} | kwargs
+        prompt = {"role": "user", "content": self.prompt(model, feedback)}
+        response = await self.client.chat.completions.create(
+            model=self.llm_model,
+            messages=[*self.transcript, prompt],
+            **settings,
+        )
+        choice = response.choices[0]
+        reply = choice.message.content or ""
+        proposed = splice(model, reply, getattr(choice, "finish_reason", None))
+        # The exchange is committed only once it has yielded a model: an agent
+        # whose call failed, was cancelled, or came back unusable starts its
+        # next round from the last transcript that made sense, rather than
+        # carrying a dangling prompt or a truncated reply into it.
+        self.transcript += [prompt, {"role": "assistant", "content": reply}]
+        return proposed
 
     def reset(self) -> None:
         """Drop the conversation, keeping only the system prompt."""
