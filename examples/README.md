@@ -41,6 +41,32 @@ until the residuals fit inside it.
 The starting process is a level and a linear trend, which is wrong in every way
 the data are interesting: no yearly season, no weekday effect, no holidays.
 
+### Looking at the data first
+
+```sh
+uv run python -m examples.birthdates --url http://host:8000/v1 --agents 8 --analysis
+```
+
+With `--analysis`, each agent gets its own conversation and a `run_python` tool
+over the training days -- numpy, pandas, `births` and the five features, and a
+`df` of all of them -- and may run up to `--tool-budget` snippets before it
+proposes. `examples/birthdates/analysis.py` is what builds that namespace.
+
+It builds it from `data.load(...)[0]`, the training split, and never touches the
+second half of the pair. A proposer that could measure the years it is about to
+be scored on would be choosing its model with the answer in front of it, and
+`elpd_holdout` would stop meaning what the table says it means. The rest of the
+environment's isolation is described in the top-level README; the split is the
+part that is this example's responsibility.
+
+The server has to be started for tool calling -- for vLLM that is
+`--enable-auto-tool-choice --tool-call-parser hermes` for the Qwen models.
+Without it every agent fails with a `ToolCallError` saying so.
+
+`--analysis-workers` (4) bounds how many snippets run at once across all agents,
+whatever `--agents` is. Nothing is logged unless the queue makes an agent wait,
+which is the signal that the number wants raising.
+
 ### The partition
 
 Train on 1969-1984 (5844 days), hold out 1985-1988 (1461 days). The holdout is

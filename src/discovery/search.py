@@ -1,4 +1,4 @@
-"""I.I.D. search: one prompt, N samples, drawn together.
+"""I.I.D. search: one prompt, N samples, drawn together -- and its agentic twin.
 
 A search is one batch of draws from ``p(model | parent, feedback)`` -- no more.
 It is also one request: the server is asked for `n` samples of the same prompt,
@@ -20,6 +20,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from discovery.analysis import Analysis
 from discovery.model import Model
 from discovery.proposer import SYSTEM_PROMPT, ModelProposer, splice
 
@@ -171,6 +172,105 @@ class IIDSearch:
                 await result
 
     async def __aenter__(self) -> "IIDSearch":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
+
+
+@dataclass
+class AgentSearch:
+    """N agents against one parent model, each in its own conversation.
+
+    The same draw as `IIDSearch`, paid for differently. An agent that uses tools
+    has to be asked again after every snippet it runs, and a multi-turn exchange
+    cannot be one `n`-sample request, so this is N requests where the i.i.d.
+    search is one: the prompt is prefilled per agent rather than once. Prefix
+    caching on the server recovers most of that, since the system prompt and the
+    parent model are a shared prefix, but the batched search remains the cheaper
+    way to draw proposals that do not need to look at anything.
+
+    What is bought for it is the `analysis`. There is no search-level timeout:
+    the tool budget bounds how long an agent can go on looking, `max_tokens`
+    bounds how long it can go on thinking, and the client's own request timeout
+    bounds a server that has stopped answering.
+
+    Each agent keeps its conversation, so calling `propose` twice continues N
+    conversations rather than starting them again. `reset` starts them over.
+    """
+
+    url: str
+    llm_model: str
+    agents: int = 8
+    decode: Decode = field(default_factory=Decode)
+    api_key: str = "EMPTY"
+    system_prompt: str = SYSTEM_PROMPT
+    #: the data environment offered to every agent, or None for no tools
+    analysis: Analysis | None = None
+    tool_budget: int = 6
+    client: Any = None
+    proposers: tuple[ModelProposer, ...] = field(init=False, default=())
+    _owns_client: bool = field(init=False, default=False)
+
+    def __post_init__(self) -> None:
+        if self.agents < 1:
+            raise ValueError(f"need at least one agent, got {self.agents}")
+        if self.client is None:
+            self.client = AsyncOpenAI(base_url=self.url, api_key=self.api_key)
+            self._owns_client = True
+        # One client, N conversations: the agents are independent in what they
+        # say and share only the connection pool they say it down.
+        self.proposers = tuple(
+            ModelProposer(
+                url=self.url,
+                llm_model=self.llm_model,
+                api_key=self.api_key,
+                system_prompt=self.system_prompt,
+                analysis=self.analysis,
+                tool_budget=self.tool_budget,
+                client=self.client,
+            )
+            for _ in range(self.agents)
+        )
+
+    async def propose(
+        self, model: Model, feedback: str | None = None, **kwargs: Any
+    ) -> tuple[Proposal, ...]:
+        """Draw one proposal per agent, returned in agent order.
+
+        Every way one agent can fail -- an unreadable reply, a spent tool
+        budget, a request that never came back -- costs that agent and nothing
+        else, so a batch is as long as its slowest agent and as good as its best.
+        """
+        if self.analysis is not None:
+            await self.analysis.start()
+        settings = self.decode.kwargs() | kwargs
+
+        async def one(agent: int, proposer: ModelProposer) -> Proposal:
+            try:
+                return Proposal(agent=agent, model=await proposer.propose(model, feedback, **settings))
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                return Proposal(agent=agent, error=error)
+
+        return tuple(await asyncio.gather(*(one(a, p) for a, p in enumerate(self.proposers))))
+
+    def reset(self) -> None:
+        """Start every agent's conversation again."""
+        for proposer in self.proposers:
+            proposer.reset()
+
+    async def aclose(self) -> None:
+        """Close the client, if this search is the one that opened it."""
+        if not self._owns_client:
+            return
+        if close := getattr(self.client, "close", None):
+            result = close()
+            if isawaitable(result):
+                await result
+
+    async def __aenter__(self) -> "AgentSearch":
         return self
 
     async def __aexit__(self, *exc: object) -> None:

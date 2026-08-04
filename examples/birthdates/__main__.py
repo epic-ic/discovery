@@ -11,16 +11,19 @@ which is the fastest way to see the whole evaluation path work.
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
 import urllib.request
 from pathlib import Path
 
+from discovery.analysis import Analysis
 from discovery.evaluator import evaluate
 from discovery.model import Model
 from discovery.report import write
-from discovery.search import Decode, IIDSearch, models
+from discovery.search import AgentSearch, Decode, IIDSearch, models
 
+from examples.birthdates import analysis as setup
 from examples.birthdates import data
 from examples.birthdates.fit import Budget, Posterior
 from examples.birthdates.initial import BRIEF, SOURCE
@@ -53,6 +56,17 @@ def options(argv: list[str] | None = None) -> argparse.Namespace:
     llm.add_argument("--search-timeout", type=float, default=900.0)
     llm.add_argument("--no-search", action="store_true", help="fit only the starting model")
 
+    tools = parser.add_argument_group("data analysis at proposal time")
+    tools.add_argument(
+        "--analysis",
+        action="store_true",
+        help="let agents explore the training data before proposing; needs a server started "
+        "with --enable-auto-tool-choice and --tool-call-parser",
+    )
+    tools.add_argument("--analysis-workers", type=int, default=4, help="snippets running at once")
+    tools.add_argument("--tool-budget", type=int, default=6, help="snippets one agent may run")
+    tools.add_argument("--analysis-timeout", type=float, default=20.0, help="seconds per snippet")
+
     fit = parser.add_argument_group("fit, identical for every candidate")
     fit.add_argument("--data", default=str(data.DEFAULT), type=str)
     fit.add_argument("--holdout-from", type=int, default=1985, help="first held-out year")
@@ -78,30 +92,88 @@ def served(url: str) -> str:
 
 
 async def propose(settings: argparse.Namespace, start: Model, brief: str) -> tuple[Model, ...]:
-    """One i.i.d. round: N proposals against the same parent, in one request."""
+    """One round of proposals against the same parent model.
+
+    Two ways to draw it. Without `--analysis` it is one request for N samples,
+    which is the cheaper draw. With it, each agent gets its own conversation and
+    the `run_python` tool over the training days, which costs N prefills and
+    buys proposals written by agents that have actually looked at the data.
+    """
     llm_model = settings.llm_model or served(settings.url)
+    decode = Decode(
+        temperature=settings.temperature,
+        top_p=settings.top_p,
+        top_k=settings.top_k,
+        max_tokens=settings.max_tokens,
+        thinking_token_budget=settings.thinking_token_budget,
+    )
+    shared = {
+        "url": settings.url,
+        "llm_model": llm_model,
+        "api_key": settings.api_key,
+        "agents": settings.agents,
+        "decode": decode,
+    }
     print(f"asking {settings.agents} agents on {llm_model} for a generating process")
-    async with IIDSearch(
-        url=settings.url,
-        llm_model=llm_model,
-        api_key=settings.api_key,
-        agents=settings.agents,
-        timeout=settings.search_timeout,
-        decode=Decode(
-            temperature=settings.temperature,
-            top_p=settings.top_p,
-            top_k=settings.top_k,
-            max_tokens=settings.max_tokens,
-            thinking_token_budget=settings.thinking_token_budget,
-        ),
-    ) as search:
-        proposals = await search.propose(start, feedback=brief)
+
+    if not settings.analysis:
+        async with IIDSearch(**shared, timeout=settings.search_timeout) as search:
+            proposals = await search.propose(start, feedback=brief)
+    else:
+        pool = Analysis(
+            setup=setup.__name__,
+            description=setup.DESCRIPTION,
+            workers=settings.analysis_workers,
+            timeout=settings.analysis_timeout,
+            setup_env={
+                "BIRTHDATES_DATA": settings.data,
+                "BIRTHDATES_HOLDOUT_FROM": str(settings.holdout_from),
+            },
+        )
+        print(f"  with {settings.analysis_workers} analysis workers, {settings.tool_budget} calls each")
+        async with pool, AgentSearch(**shared, analysis=pool, tool_budget=settings.tool_budget) as search:
+            proposals = await search.propose(start, feedback=brief)
+
     for proposal in proposals:
         if not proposal.ok:
             print(f"  agent {proposal.agent}: {type(proposal.error).__name__}: {proposal.error}")
     kept = models(proposals)
     print(f"{len(kept)}/{len(proposals)} proposals parsed")
+    if failed := failures(proposals, settings.out):
+        print(f"failed agents: {failed}")
     return kept
+
+
+def failures(proposals, out: Path) -> Path | None:
+    """Write out what the failed agents had done, if anything.
+
+    A failed proposal is never committed to its transcript, so without this the
+    six snippets an agent ran and every number it read vanish with the model it
+    did not write -- and the report only keeps candidates that were fitted. The
+    error carries the exchange precisely so somebody can read it afterwards, and
+    a run where most agents failed is a run where that is the only evidence
+    there is.
+    """
+    records = [
+        {
+            "agent": p.agent,
+            "error": f"{type(p.error).__name__}: {p.error}",
+            "reply": getattr(p.error, "reply", None),
+            "finish_reason": getattr(p.error, "finish_reason", None),
+            "exchange": getattr(p.error, "exchange", []),
+        }
+        for p in proposals
+        if not p.ok
+    ]
+    if not records:
+        return None
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "failures.jsonl"
+    with open(path, "w") as handle:
+        for record in records:
+            json.dump(record, handle, default=str)
+            handle.write("\n")
+    return path
 
 
 def table(evaluations) -> str:
@@ -138,6 +210,9 @@ async def main(argv: list[str] | None = None) -> int:
     settings = options(argv)
     if not settings.no_search and not settings.url:
         raise SystemExit("--url (or $DISCOVERY_URL) is required unless --no-search")
+    # The analysis pool says nothing unless the queue makes agents wait, which
+    # is the one thing worth seeing while a round runs.
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
     train, holdout = data.load(settings.data, settings.holdout_from)
     print(f"train   {len(train):>5} days, {train.span}")

@@ -23,7 +23,13 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=1.0",
 ]
+#: what an analysis pool's workers need; a setup module supplies the data itself
+analysis = [
+    "numpy>=2.0",
+    "pandas>=2.2",
+]
 examples = [
+    { include-group = "analysis" },
     "numpyro>=0.21",
     "jax>=0.7",
     "arviz-stats>=1.2",

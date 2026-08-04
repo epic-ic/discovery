@@ -32,6 +32,9 @@ def model(features, births=None):
       month -- 0 for January to 11 for December, int
       year  -- years since 1969, 0 to 19, int
 
+    Every one of them is already a jax array. They are not pandas: there is no
+    `.values` to take, and the only array module in scope is `jnp`.
+
     The int ones index directly: `sample("weekday", dist.Normal(0.0, 0.5)
     .expand([7]).to_event(1))[features["dow"]]` is a weekday effect.
 

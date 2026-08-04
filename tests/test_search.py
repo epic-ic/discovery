@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from discovery.model import Model
-from discovery.search import Decode, IIDSearch, models
+from discovery.search import AgentSearch, Decode, IIDSearch, models
 
 SOURCE = """\
 def model(x, y=None):
@@ -233,3 +233,113 @@ def test_the_search_offers_only_one_operation():
         if callable(value) and not name.startswith("_")
     }
     assert operations == {"propose", "aclose"}
+
+
+# --------------------------------------------------------------------------
+# AgentSearch: the same draw, as N conversations rather than one batch
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class FakeAnalysis:
+    """Stands in for the worker pool."""
+
+    description: str = "It holds `values`."
+    max_output: int = 4000
+    ran: list[str] = field(default_factory=list)
+    started: int = 0
+
+    async def start(self):
+        self.started += 1
+        return self
+
+    async def run(self, code: str) -> str:
+        self.ran.append(code)
+        return "ok"
+
+
+def agents(**kwargs) -> AgentSearch:
+    kwargs.setdefault("agents", 4)
+    client = kwargs.pop("client", None) or FakeClient(
+        **{k: kwargs.pop(k) for k in ("handler", "finish_reason") if k in kwargs}
+    )
+    return AgentSearch(
+        url="http://localhost:8000/v1", llm_model="a-model", client=client, **kwargs
+    )
+
+
+async def test_every_agent_gets_its_own_conversation(model):
+    s = agents(agents=3)
+    proposals = await s.propose(model)
+    assert len(proposals) == 3
+    assert all(p.ok for p in proposals)
+    # N requests rather than one, and none of them asks for n samples
+    assert len(s.client.calls) == 3
+    assert all("n" not in call for call in s.client.calls)
+    assert len({id(p.transcript) for p in s.proposers}) == 3
+
+
+async def test_proposals_come_back_in_agent_order(model):
+    s = agents(agents=4)
+    proposals = await s.propose(model)
+    assert [p.agent for p in proposals] == [0, 1, 2, 3]
+
+
+async def test_one_failing_agent_costs_only_itself(model):
+    # each agent is its own request, so the first request is agent 0's
+    seen: list[int] = []
+
+    def once(agent, kwargs):
+        seen.append(1)
+        return "nothing useful here" if len(seen) == 1 else reply("Laplace(0.0, 1.0)")
+
+    s = agents(agents=4, handler=once)
+    proposals = await s.propose(model)
+    assert sum(p.ok for p in proposals) == 3
+    assert len(models(proposals)) == 3
+    assert not proposals[0].ok
+
+
+async def test_decode_settings_reach_every_agent(model):
+    s = agents(agents=2, decode=Decode(temperature=0.3, max_tokens=128, top_k=7))
+    await s.propose(model)
+    for call in s.client.calls:
+        assert call["temperature"] == 0.3
+        assert call["max_tokens"] == 128
+        assert call["extra_body"]["top_k"] == 7
+
+
+async def test_the_analysis_is_started_once_and_shared(model):
+    analysis = FakeAnalysis()
+    s = agents(agents=3, analysis=analysis)
+    await s.propose(model)
+    assert analysis.started == 1
+    assert all(p.analysis is analysis for p in s.proposers)
+    assert all("run_python" in p.transcript[0]["content"] for p in s.proposers)
+
+
+async def test_agents_continue_their_conversations_across_rounds(model):
+    s = agents(agents=2)
+    first = await s.propose(model, feedback="round one")
+    await s.propose(models(first)[0], feedback="round two")
+    roles = [m["role"] for m in s.proposers[0].transcript]
+    assert roles == ["system", "user", "assistant", "user", "assistant"]
+
+
+async def test_reset_starts_the_conversations_again(model):
+    s = agents(agents=2)
+    await s.propose(model)
+    s.reset()
+    assert all(len(p.transcript) == 1 for p in s.proposers)
+
+
+async def test_a_search_closes_the_client_it_opened(model):
+    client = FakeClient()
+    async with agents(client=client):
+        pass
+    assert not client.closed  # not ours to close
+
+
+async def test_an_agent_search_also_needs_at_least_one_agent():
+    with pytest.raises(ValueError, match="at least one agent"):
+        agents(agents=0)

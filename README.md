@@ -142,7 +142,81 @@ own: a search can append each round as it finishes, and `read` skips a
 truncated tail, so the report of a run that died halfway is still a report.
 Images are the one thing that does not fit on a line; they are written to
 `artifacts/` beside the report and the record points at them.
- - [ ] Add context for proposers
+ - [x] Add context for proposers
+   - Data analysis at proposal time
+
+A proposer that has looked at the data writes a better model. `Analysis` is the
+environment it looks with: a pool of worker processes holding numpy, pandas and
+the data being fitted, offered to the agent as one tool, `run_python`.
+
+```python
+async with Analysis(setup="examples.birthdates.analysis", workers=4) as pool:
+    async with AgentSearch(
+        url="http://host:8000/v1", llm_model="Qwen/Qwen3.5-35B-A3B-FP8",
+        agents=16, analysis=pool, tool_budget=6,
+    ) as search:
+        proposals = await search.propose(Model(source), feedback=brief)
+```
+
+`setup` names an importable module exposing `namespace()`, which returns the
+names the snippet runs against, and `DESCRIPTION`, which is what the agent is
+told is in it. **`namespace()` is called before every execution**, so each
+snippet gets its own copy: mutation is contained by construction, nothing
+carries over between calls, and any worker can therefore take any call. That
+last point is what makes the pool a queue rather than an assignment — there are
+`workers` of them however many agents are asking, and an agent that has to wait
+longer than `warn_after` is logged with the number of agents still queued, since
+that is the number that says whether `workers` is set right.
+
+**It is not a sandbox.** Three cheap mechanisms cover the failures that actually
+happen when a language model explores data:
+
+ * **Nothing is written, anywhere.** Once the imports are done the worker
+   installs a `sys.addaudithook` that refuses to open a file for writing, to
+   rename or unlink one, to open a socket, or to start a process. Audit hooks
+   are stdlib, they see the operation rather than the library that reached for
+   it, and they cannot be uninstalled. `RLIMIT_FSIZE` is clamped behind it, but
+   the hook is what does the work: an rlimit alone still lets `open(path, "w")`
+   create and *truncate* a file, because neither writes a byte.
+ * **Workers are disposable.** A snippet still running after `timeout` has its
+   worker killed and replaced, and every worker is recycled after `recycle`
+   executions — a fresh namespace resets the bindings but not `sys.modules`, and
+   recycling bounds how far a snippet that patched something can follow later
+   agents.
+ * **Failures are in-band.** An exception, a runaway loop, a worker that died:
+   all of it comes back to the agent as text, and costs it one of its
+   `tool_budget` calls rather than its proposal.
+
+The last result of every turn ends with the budget remaining -- `[3 tool calls
+left.]`, and finally `[No tool calls left. Answer now with the fenced code
+block.]` -- because an agent cannot count its own calls. Told only the limit up
+front it keeps exploring until the harness cuts it off, and everything it
+learned is discarded with the proposal it never wrote. Raising `tool_budget`
+does not help on its own: measured against Qwen3.5-35B-A3B, going from 4 calls
+to 6 doubled the number of agents that exhausted it.
+
+A proposal that fails is not committed to its transcript, so `ProposalError`
+carries an `exchange` -- the turns it had got through. Without tools a failed
+agent loses one reply and the reply is the whole story; with them it loses every
+snippet it ran and everything it read, which is most of why it failed.
+
+None of that survives a determined adversary with a Python prompt. What it stops
+is the snippet that overwrites the data file it was reading.
+
+Two things the tool changes about the search. First, a multi-turn exchange
+cannot be one `n`-sample request, so `AgentSearch` is N requests where
+`IIDSearch` is one, and the prompt is prefilled per agent; prefix caching
+recovers most of it, but the batched search remains the cheaper way to draw
+proposals that need not look at anything. Second, **the server has to be started
+for tool calling** — vLLM only fills `tool_calls` with `--enable-auto-tool-choice
+--tool-call-parser <parser>`, and without them the call arrives as text in
+`content` and reads exactly like a model that ignored its instructions.
+`ToolCallError` says so rather than blaming the reply.
+
+Each agent keeps its whole exchange — every snippet it ran and everything it
+read — in its transcript, because that is the evidence behind the model it went
+on to write.
+
  - [ ] Sandbox for model generator
  - [ ] SMC Search
    - N particles
