@@ -6,7 +6,9 @@ readme = "README.md"
 authors = [
     { name = "Giovanni", email = "giovanni.charles@gmail.com" }
 ]
-requires-python = ">=3.14"
+# the harness itself is 3.11-clean; the floor is arviz-stats, which the
+# `examples` group needs and which requires >=3.12
+requires-python = ">=3.12"
 dependencies = [
     "openai>=2.0",
 ]
@@ -35,6 +37,15 @@ examples = [
     "arviz-stats>=1.2",
     "matplotlib>=3.10",
 ]
+#: the malaria example only. `msinf` is not on PyPI, so it comes from a sibling
+#: checkout; it is its own group so `examples` stays installable without one.
+#: Both projects are `>=3.11`, so this is one environment and one interpreter.
+malaria = [
+    "msinf",
+]
+
+[tool.uv.sources]
+msinf = { path = "../msinf", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

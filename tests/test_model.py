@@ -56,6 +56,41 @@ def test_substitute_replaces_only_the_named_block():
     assert [b.name for b in new.blocks] == ["prior", "likelihood"]
 
 
+def test_substitute_replaces_several_named_blocks_at_once():
+    """The malaria example splices two regions from one reply.
+
+    `birthdates` only ever exercises one, so until there was a second example
+    "splices back in by name" was a claim about code nobody had run that way.
+    Both blocks have to move, each to its own marker, and the scaffolding
+    between them has to survive.
+    """
+    new = Model(SOURCE).substitute(
+        {
+            "prior": '    slope = sample("slope", Cauchy(0.0, 1.0))',
+            "likelihood": '    return sample("y", StudentT(3.0, mu, 1.0), obs=y)',
+        }
+    )
+    assert "Cauchy(0.0, 1.0))" in new.source
+    assert "StudentT(3.0, mu, 1.0)" in new.source
+    assert "Normal(" not in new.source.split("def model")[1]
+    assert "mu = slope * x" in new.source
+    assert [b.name for b in new.blocks] == ["prior", "likelihood"]
+
+
+def test_parse_blocks_reads_several_regions_from_one_reply():
+    """A proposer answers with both regions in a single fenced block."""
+    reply = (
+        "Here is my proposal.\n\n```python\n"
+        "# @discovery:begin parameters\nreturn {'a': sample('a', Beta(2.0, 2.0))}\n# @discovery:end\n\n"
+        "# @discovery:begin curves\nreturn params['a'] * ages, ages\n# @discovery:end\n"
+        "```\n"
+    )
+    assert parse_blocks(reply) == {
+        "parameters": "return {'a': sample('a', Beta(2.0, 2.0))}",
+        "curves": "return params['a'] * ages, ages",
+    }
+
+
 def test_substitute_handles_multi_line_bodies():
     new = Model(SOURCE).substitute({"prior": "    a = 1\n    b = 2\n    slope = a + b"})
     assert new.blocks[0].body == "    a = 1\n    b = 2\n    slope = a + b"
