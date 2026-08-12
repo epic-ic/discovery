@@ -1,4 +1,4 @@
-"""Fit one candidate curve family under both splits, and score it.
+"""Fit one candidate curve family under every split, and score it.
 
 A child process: a JSON configuration arrives on stdin, one JSON object leaves
 on stdout, anything that goes wrong leaves on stderr with a non-zero exit. Model
@@ -18,13 +18,11 @@ claims.
 
 What is left here is the part msinf has no opinion about: compiling a candidate,
 refusing to fit one that fails the cheap gates, asking whether the data moved
-each of its parameters, and putting both splits in one dictionary.
+each of its parameters, and putting every split in one dictionary.
 
-Two fits, not one. The splits are fitted separately because each holds out
-different rows, and they are reported separately and never averaged: the study
-split leaves a held-out study's `log_eir` on its prior and is blunt enough that
-the fold can cost more than a candidate does, while the age-band split keeps
-`log_eir` informed and tests age structure.
+One fit per split, and `data.SPLITS` is currently one split -- the study fold.
+The loop stays a loop because splits hold out different rows and so cannot share
+a fit, and because their numbers are reported separately and never averaged.
 """
 
 import base64
@@ -213,7 +211,8 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
     sampler_kwargs = model_kwargs_for_sampler(whole)
     ages = asfloat(GRIFFIN_AGE_GRID)
 
-    metrics: dict[str, float] = {}
+    # Scalars, and the per-unit elpd vectors that the `elpd_*` totals sum.
+    metrics: dict[str, float | tuple[float, ...]] = {}
 
     # (i) the gates, before a single second is spent sampling. A bad candidate
     # here runs and returns plausible-looking nonsense rather than raising, so
@@ -255,7 +254,6 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
             kind=kind,
             seed=config["holdout_seed"],
             n_studies=config["n_studies"],
-            from_age=config["from_age"],
         )
         result = evaluate(
             cfg,
@@ -267,6 +265,15 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
             figures=True,
         )
         metrics |= {f"{kind}.{name}": float(v) for name, v in result.metrics.items()}
+        # The per-unit elpd behind each total. Carried as vectors rather than
+        # summarised here because the useful comparison is between candidates,
+        # which this process cannot see: it fits one model and knows nothing
+        # about the others. The driver holds the leaderboard and does the
+        # pairing -- see `elpd_diff` in `examples/estimators.py`.
+        metrics |= {
+            f"{kind}.pointwise_{name}": tuple(float(x) for x in vector)
+            for name, vector in result.pointwise.items()
+        }
         artifacts |= {
             f"{kind}.{name.removesuffix('.png')}": base64.b64encode(payload).decode()
             for name, payload in result.figures.items()
@@ -293,7 +300,7 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
         worst["mcmc_seconds"].append(result.metrics.get("mcmc_seconds", float("nan")))
 
     # (iv) the run-level summary: the worst of the splits, not the average of
-    # them. A candidate whose chains converged under one fold and not the other
+    # them. A candidate whose chains converged under one fold and not another
     # has not converged.
     with np.errstate(invalid="ignore"):
         metrics["rhat_max"] = float(np.nanmax(worst["rhat_max"]))

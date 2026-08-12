@@ -7,8 +7,8 @@ incidence and prevalence likelihoods, the site EIR priors, `ft_study`, the age
 grid, the demography, the age-bin averaging -- and what varies between
 candidates is only the curve provider: the map from parameters to prevalence and
 incidence over age. One round: ask N agents for a curve family, fit every
-proposal and the model it started from under both splits with the same NUTS
-budget, score them all, write the report.
+proposal and the model it started from under the same NUTS budget, score them
+all, write the report.
 
 Two starting models, and `--start both` is the point of the exercise. `scratch`
 is deliberately poor and asks what a search finds from nothing; `griffin` is the
@@ -23,7 +23,7 @@ is the fastest way to see the whole evaluation path work -- though "fastest" her
 is a fit per split per model, at tens of minutes each.
 
 `--analysis` gives every agent the training rows before it proposes: the study
-table with the folds this run scores removed, the model's age grid and the
+table with the fold this run scores removed, the model's age grid and the
 demography that weights it. numpy and pandas, no jax, and no candidate is run --
 the gates already do that, in the fit, where a backend is already paid for.
 """
@@ -43,18 +43,24 @@ from discovery.model import Model
 from discovery.report import write
 from discovery.search import AgentSearch, Decode, IIDSearch, models
 
+from examples.estimators import elpd_diff
 from examples.malaria import analysis as setup
 from examples.malaria import data
 from examples.malaria.fit import Budget, Posterior
 from examples.malaria.initial import BRIEF, STARTS
 
-#: the score models are ranked by. The age-band split rather than the study
-#: split: it leaves each site's `log_eir` informed by that study's training rows,
-#: so what it measures is age structure, which is what a model of acquired
-#: immunity actually claims to explain. The study split is blunter -- a held-out
-#: study's EIR sits on its prior, and that variance can swamp the difference
-#: between two reasonable candidates -- so it is reported, not ranked on.
-RANK = "posterior.age_band.elpd_holdout"
+#: the score models are ranked by, and the one number this example has to rank
+#: on -- see `data.SPLITS` for why the age-band split it used to rank on is gone.
+#:
+#: Read it knowing what it is blunt about. A held-out study's `log_eir` sits on
+#: its prior, so a large part of this number is the EIR-to-outcome mapping
+#: integrated over a wide prior: machinery every candidate shares, which adds a
+#: common offset and a lot of variance while discriminating weakly between two
+#: reasonable curve families. It separates working candidates from broken ones
+#: cleanly; it does not, on 35 scoring units, reliably order the top few. Until
+#: the per-unit log-likelihoods are reported and differences carry a standard
+#: error, treat the top of the table as unordered.
+RANK = "posterior.study.elpd_holdout"
 
 #: roughly what one fit of this model costs, in minutes, at the default budget.
 #: Load-bearing: it sizes `--fit-timeout` and it is what the proposer is told,
@@ -122,8 +128,6 @@ def options(argv: list[str] | None = None) -> argparse.Namespace:
                      help="comma separated; one fit each, reported separately")
     fit.add_argument("--holdout-seed", type=int, default=42, help="the study-split fold")
     fit.add_argument("--n-studies", type=int, default=3, help="studies held out by the study split")
-    fit.add_argument("--from-age", type=float, default=5.0,
-                     help="first held-out age band; must fall between age brackets")
     fit.add_argument("--warmup", type=int, default=400)
     fit.add_argument("--samples", type=int, default=400, help="post-warmup draws per chain")
     fit.add_argument("--chains", type=int, default=4)
@@ -225,15 +229,68 @@ def failures(proposals, out: Path) -> Path | None:
     return path
 
 
-def table(evaluations, origin: dict[int, str], starts: set[int], splits: tuple[str, ...]) -> str:
-    """The run, ranked by held-out likelihood on the age-band split.
+#: the split the table's `vs best` column pairs on, taken from `RANK` so the
+#: two can never disagree about which fold is being compared.
+RANKED_SPLIT = RANK.split(".")[1]
 
-    Both splits' `elpd_holdout` are shown and neither is averaged into the other:
-    they answer different questions and the study split is much the noisier.
+
+def pointwise(evaluation, kind: str) -> tuple[float, ...] | None:
+    """One candidate's per-unit held-out elpd under `kind`, cells then rows.
+
+    `None` if it was not scored -- a gated or failed candidate has no vector,
+    and neither does a report written before `pointwise_*` existed.
+    """
+    parts = []
+    for stream in ("incidence", "prevalence"):
+        vector = evaluation.scores.get(f"posterior.{kind}.pointwise_holdout_{stream}")
+        if vector is None:
+            return None
+        parts.extend(float(x) for x in vector)
+    return tuple(parts)
+
+
+def leads(order, kind: str) -> dict[int, str]:
+    """Each candidate's lead over the best one, as `diff+-se`, by index.
+
+    The column that stops the table being read as a ranking when it is not one.
+    The totals in `elpd/study` differ by tens of nats on a fold of a few dozen
+    units, and without the paired error beside them there is no way to see that
+    the top few are indistinguishable. Empty for the reference row itself, and
+    for anything that cannot be paired with it.
+    """
+    scored = [e for e in order if e.ok and pointwise(e, kind) is not None]
+    if not scored:
+        return {}
+    best, *rest = scored
+    reference = pointwise(best, kind)
+    out = {best.index: "ref"}
+    for evaluation in rest:
+        try:
+            difference, se = elpd_diff(pointwise(evaluation, kind), reference)
+        except ValueError:
+            # Different fold, so not comparable. It should not happen in one
+            # run -- every candidate is fitted under the same split -- and if it
+            # does, saying nothing beats printing a number that means nothing.
+            continue
+        out[evaluation.index] = f"{difference:+.0f}+-{se:.0f}" if se == se else f"{difference:+.0f}"
+    return out
+
+
+def table(evaluations, origin: dict[int, str], starts: set[int], splits: tuple[str, ...]) -> str:
+    """The run, ranked by held-out likelihood on the study split -- see `RANK`.
+
+    One `elpd_holdout` column per split fitted, and they are never averaged into
+    each other: different splits answer different questions.
+
+    `vs best` is the paired difference against the top row and its standard
+    error, both in nats. Read it before the `elpd` column it qualifies: a lead
+    smaller than about twice its error is not a lead, and on this fold that
+    covers most of the gap between reasonable candidates.
     """
     columns = [("from", None, "{:>8}")]
     columns += [(f"elpd/{kind[:5]}", f"posterior.{kind}.elpd_holdout", "{:>11.1f}") for kind in splits]
     columns += [
+        ("vs best", "", "{:>11}"),
         ("cover90", f"posterior.{splits[-1]}.coverage90_holdout_prev_m", "{:>7.3f}"),
         ("kl_min", "posterior.kl_min", "{:>7.2f}"),
         ("unid", "posterior.unidentified", "{:>4.0f}"),
@@ -244,6 +301,7 @@ def table(evaluations, origin: dict[int, str], starts: set[int], splits: tuple[s
         ("pars", "posterior.parameters", "{:>4.0f}"),
     ]
     order = sorted(evaluations, key=lambda e: (not e.ok, -e.scores.get(RANK, float("-inf"))))
+    against_best = leads(order, RANKED_SPLIT)
 
     lines = ["  #  " + " ".join(f"{name:>{len(fmt.format(0)) }}" for name, _, fmt in columns)]
     for evaluation in order:
@@ -257,6 +315,8 @@ def table(evaluations, origin: dict[int, str], starts: set[int], splits: tuple[s
         for name, key, fmt in columns:
             if key is None:
                 cells.append(fmt.format(parent))
+            elif key == "":
+                cells.append(fmt.format(against_best.get(evaluation.index, "-")))
             elif key not in evaluation.scores:
                 cells.append("-".rjust(len(fmt.format(0))))
             else:
@@ -282,8 +342,7 @@ async def main(argv: list[str] | None = None) -> int:
     summary = data.read(inputs.table)
     print(f"table   {summary}")
     for kind in splits:
-        name = data.label(kind, settings.holdout_seed, settings.n_studies, settings.from_age)
-        print(f"split   {name}")
+        print(f"split   {data.label(kind, settings.holdout_seed, settings.n_studies)}")
 
     timeout = settings.fit_timeout
     if timeout is None:
@@ -291,7 +350,6 @@ async def main(argv: list[str] | None = None) -> int:
     brief = BRIEF.format(
         table=summary,
         study=settings.n_studies,
-        from_age=settings.from_age,
         chains=settings.chains,
         warmup=settings.warmup,
         samples=settings.samples,
@@ -317,7 +375,6 @@ async def main(argv: list[str] | None = None) -> int:
                 "MALARIA_SPLITS": ",".join(splits),
                 "MALARIA_HOLDOUT_SEED": str(settings.holdout_seed),
                 "MALARIA_N_STUDIES": str(settings.n_studies),
-                "MALARIA_FROM_AGE": str(settings.from_age),
             },
         )
         await pool.start()
@@ -359,7 +416,6 @@ async def main(argv: list[str] | None = None) -> int:
         splits=splits,
         holdout_seed=settings.holdout_seed,
         n_studies=settings.n_studies,
-        from_age=settings.from_age,
         warmup=settings.warmup,
         samples=settings.samples,
         chains=settings.chains,

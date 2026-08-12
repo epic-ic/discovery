@@ -4,13 +4,15 @@ The rows this run will be scored on are not here, and that is the whole point of
 the module. `runner.py` fits one model per split and the report ranks on
 `elpd_holdout`; a proposer that could measure the rows behind that number would
 be choosing its curve family with the answer in front of it. So `namespace()`
-draws the same splits the fit will draw -- same seed, same `n_studies`, same
-`from_age`, through `msinf.splits`, which is the package that owns the drawing --
-and returns what is left.
+draws the same splits the fit will draw -- same seed, same `n_studies`, through
+`msinf.splits`, which is the package that owns the drawing -- and returns what is
+left.
 
-The union, when a run fits more than one split. `--splits study,age_band` is the
-default and both numbers reach the report, so a row held out by either fold is a
-row the proposer must not see. A single-split run hides a single split's rows.
+The union, if a run ever fits more than one split: a row held out by any fold is
+a row behind a number in the report, and so a row the proposer must not see.
+Today `data.SPLITS` is the study fold alone, so the union is that one fold's
+rows -- roughly 19% of the table at the default seed, leaving the proposer 181
+of 223 rows across the full 0-20y range.
 
 **numpy and pandas only, and it is worth some duplication to keep it that way.**
 No jax, no numpyro, no dmeq, and no candidate is executed here. Nothing a
@@ -210,7 +212,6 @@ def build() -> tuple:
             kind=kind,
             seed=int(os.environ.get("MALARIA_HOLDOUT_SEED", "42")),
             n_studies=int(os.environ.get("MALARIA_N_STUDIES", "3")),
-            from_age=float(os.environ.get("MALARIA_FROM_AGE", "5.0")),
         )
         held |= split_mask(frame, split)
     if held.all():

@@ -1,16 +1,16 @@
-"""One evaluator: two NUTS fits, every score and every plot that comes out of them.
+"""One evaluator: a NUTS fit per split, every score and every plot that comes out.
 
 The harness's unit of work is one evaluator on one model, and its result is a
-dictionary -- so identifiability, held-out likelihood under both splits,
-coverage, convergence, cost and the pictures are keys of one dictionary returned
-by one call and cannot disagree about which fits they describe.
+dictionary -- so identifiability, held-out likelihood, coverage, convergence,
+cost and the pictures are keys of one dictionary returned by one call and cannot
+disagree about which fits they describe.
 
 One thing differs from `birthdates/fit.py`, and it comes from the child needing
 `msinf`: a much longer clock. One fit of this model is tens of minutes rather
-than tens of seconds, and every candidate is fitted once per split, so `timeout`
-here is hours where birthdates' is minutes. It is still a wall clock and not a
-budget: the budget is `warmup`/`samples`/`chains`, identical for every candidate,
-and the timeout only bounds what a pathological candidate can cost.
+than tens of seconds, so `timeout` here is hours where birthdates' is minutes.
+It is still a wall clock and not a budget: the budget is
+`warmup`/`samples`/`chains`, identical for every candidate, and the timeout only
+bounds what a pathological candidate can cost.
 """
 
 import asyncio
@@ -64,11 +64,10 @@ class Budget:
     table: str = str(data.DEFAULT_TABLE)
     eir_priors: str = str(data.DEFAULT_EIR_PRIORS)
     mortality: str | None = data.DEFAULT_MORTALITY
-    #: the splits to fit, one fit each, reported separately and never averaged
+    #: the splits to fit, one fit each. One of them -- see `data.SPLITS`.
     splits: tuple[str, ...] = data.SPLITS
     holdout_seed: int = 42
     n_studies: int = 3
-    from_age: float = 5.0
     warmup: int = 400
     samples: int = 400
     chains: int = 4
@@ -128,7 +127,7 @@ async def run(source: str, budget: Budget, timeout: float | None = None) -> dict
 class Posterior(Diagnostics):
     """Everything the fits have to say about one candidate curve family.
 
-    Per split -- `study.` and `age_band.` -- because the two are never averaged:
+    Prefixed by split -- `study.` -- so the key says which fold it came from:
 
      * `elpd_holdout` -- held-out density with the random effects marginalised
        exactly as the fitted likelihood marginalises them, and `elpd_train` on
@@ -136,6 +135,13 @@ class Posterior(Diagnostics):
        unit as `_per_cell` and `_per_row`: incidence is scored per *cell*
        (site x age-group), not per row, because `v_jk` is integrated out at the
        cell level and the marginal does not factorise.
+     * `elpd_holdout_se` -- that total's own standard error over its units, so a
+       total is not read as though it were exact.
+     * `pointwise_holdout_incidence`, `pointwise_holdout_prevalence`, and the
+       `_train` pair -- the per-unit vectors those totals sum, in the fold's own
+       order. Two candidates fitted under the same split line up elementwise,
+       which is what makes `estimators.elpd_diff` able to say whether a lead is
+       real. This is the only metric here that is a vector rather than a number.
      * `coverage90_holdout_inc`, `coverage90_holdout_prev_m` -- how often the
        held-out count fell inside the 90% predictive interval.
      * `kl.<parameter>` -- the information the data added to each of the
@@ -143,10 +149,10 @@ class Posterior(Diagnostics):
        `unidentified` counts those it did not move.
      * `max_r_hat`, `min_ess`, `min_ess_tail`, `n_divergent`, `mcmc_seconds`.
 
-    And unprefixed, across both splits: `rhat_max`, `ess_tail_min` and
-    `divergences` are the worst of the two rather than the average, since a
-    candidate that converged under one fold and not the other has not converged;
-    `kl_min` is the least-identified parameter under either; `parameters` is how
+    And unprefixed, across every split fitted: `rhat_max`, `ess_tail_min` and
+    `divergences` are the worst of them rather than the average, since a
+    candidate that converged under one fold and not another has not converged;
+    `kl_min` is the least-identified parameter under any; `parameters` is how
     many scalar coordinates the candidate declared.
 
     The pictures are the posterior predictive check and the randomised-PIT
@@ -154,7 +160,7 @@ class Posterior(Diagnostics):
     """
 
     budget: Budget = field(default_factory=Budget)
-    #: two fits of tens of minutes each, plus a scoring pass that re-solves the
+    #: a fit of tens of minutes per split, plus a scoring pass that re-solves the
     #: equilibrium once per retained draw
     timeout: float | None = 7200.0
 
@@ -162,7 +168,13 @@ class Posterior(Diagnostics):
         report = await run(model.source, self.budget, self.timeout)
         if reasons := report.get("gates"):
             raise GateError("; ".join(reasons))
-        return report["metrics"] | {
+        # json has no tuples, so the `pointwise_*` vectors arrive as lists and
+        # are put back into the shape the harness's `Vector` names.
+        metrics = {
+            name: tuple(value) if isinstance(value, list) else value
+            for name, value in report["metrics"].items()
+        }
+        return metrics | {
             name: Artifact(name, base64.b64decode(payload))
             for name, payload in report["artifacts"].items()
         }

@@ -29,7 +29,7 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_TABLE = Path(os.environ.get("MALARIA_TABLE", HERE / "study_data_2014_age_le20.csv"))
 
 #: per-site EIR priors, resolved over every site in the table including the ones
-#: a study holdout removes from the fit: scoring a held-out site means drawing
+#: the study holdout removes from the fit: scoring a held-out site means drawing
 #: its `log_eir` from the prior, so the prior row has to exist.
 DEFAULT_EIR_PRIORS = Path(os.environ.get("MALARIA_EIR_PRIORS", HERE / "eir_site_priors_griffin2014.csv"))
 
@@ -37,10 +37,22 @@ DEFAULT_EIR_PRIORS = Path(os.environ.get("MALARIA_EIR_PRIORS", HERE / "eir_site_
 #: default keeps dmeq's uniform rate, which is what every published run used.
 DEFAULT_MORTALITY = os.environ.get("MALARIA_MORTALITY") or None
 
-#: the splits, as `msinf.splits.KINDS` names them. Reported separately and never
-#: averaged: the study split holds `log_eir` on its prior and is the blunter of
-#: the two, the age-band split leaves `log_eir` informed and tests age structure.
-SPLITS = ("study", "age_band")
+#: the splits, as `msinf.splits.KINDS` names them.
+#:
+#: The study split, and only it. `age_band` is a coherent question -- it leaves
+#: `log_eir` informed and so tests age structure rather than transmission -- but
+#: not one this table can be asked: an incidence cell is a (site, age_bracket)
+#: pair and 43 of the 76 cells span more than one `age0`, so almost every
+#: boundary cuts a cell in half and `msinf.splits` refuses it. The only legal
+#: interior cuts are 2y, which holds out 71% of the rows and leaves the fit
+#: training on infants alone, and 15y, which holds out 19. Neither is worth a
+#: second fit per candidate, and the 5y that used to be the default here was
+#: refused outright.
+#:
+#: Left as a tuple, rather than folded away into a scalar, because the metric
+#: keys are prefixed with it (`study.elpd_holdout`) and because leave-one-study-
+#: out is the next thing that wants a slot here.
+SPLITS = ("study",)
 
 #: observation type codes in the table
 TYPE_INCIDENCE = 1
@@ -144,7 +156,7 @@ def read(path: str | Path = DEFAULT_TABLE) -> Summary:
     return Summary(rows, len(studies), len(sites), by_stream, lo, hi)
 
 
-def label(kind: str, seed: int = 42, n_studies: int = 3, from_age: float = 5.0) -> str:
+def label(kind: str, seed: int = 42, n_studies: int = 3) -> str:
     """A split's name, spelled the way `msinf.splits.Split.label` spells it.
 
     Duplicated on purpose: the driver prints the label before anything has
@@ -155,6 +167,4 @@ def label(kind: str, seed: int = 42, n_studies: int = 3, from_age: float = 5.0) 
         return "none"
     if kind == "study":
         return f"study_n{n_studies}_seed{seed}"
-    if kind == "age_band":
-        return f"age_band_from{from_age:g}"
     raise ValueError(f"unknown split kind {kind!r}; expected one of {('none',) + SPLITS}")

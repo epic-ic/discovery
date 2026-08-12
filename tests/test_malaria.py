@@ -19,12 +19,15 @@ import importlib.util
 import os
 import sys
 import textwrap
+import types
 from pathlib import Path
 
 import pytest
 
 from discovery.model import Model
 
+from examples.estimators import elpd_diff
+from examples.malaria import __main__ as driver
 from examples.malaria import data, initial
 
 # ---------------------------------------------------------------------------
@@ -61,9 +64,75 @@ def test_a_proposal_rewriting_both_regions_splices_into_a_whole_model():
 def test_split_labels_match_the_ones_msinf_writes():
     assert data.label("none") == "none"
     assert data.label("study", seed=7, n_studies=2) == "study_n2_seed7"
-    assert data.label("age_band", from_age=5.0) == "age_band_from5"
     with pytest.raises(ValueError):
         data.label("random_rows")
+
+
+def test_a_paired_difference_is_sharper_than_either_total():
+    """Why `vs best` exists, and why two totals plus their own errors will not do.
+
+    Both candidates are scored on the same units, so a unit that is hard for one
+    is hard for both. Differencing removes that shared difficulty; not
+    differencing leaves it in, and it is much the larger part.
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    difficulty = rng.normal(-6.0, 2.0, 35)
+    a = difficulty + rng.normal(0.0, 0.3, 35)
+    b = difficulty + rng.normal(-0.5, 0.3, 35)
+
+    difference, se = elpd_diff(a, b)
+    assert difference == pytest.approx(a.sum() - b.sum())
+    own = min(np.sqrt(35) * a.std(ddof=1), np.sqrt(35) * b.std(ddof=1))
+    assert se < own / 2
+
+
+def test_candidates_scored_on_different_folds_are_refused():
+    """Silence beats a number that means nothing: the units have to line up."""
+    with pytest.raises(ValueError, match="same units in the same order"):
+        elpd_diff([1.0, 2.0, 3.0], [1.0, 2.0])
+
+
+def test_the_table_marks_a_lead_inside_its_own_error():
+    """The column earns its place by what it says about the top two rows.
+
+    A near-tie and a real gap have to read differently, or the table is still a
+    ranking of numbers that cannot be ranked.
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(1)
+    difficulty = rng.normal(-6.0, 1.5, 35)
+    scored = {}
+    for index, offset in ((0, 0.0), (1, -0.05), (2, -3.0)):
+        pointwise = difficulty + rng.normal(offset, 0.2, 35)
+        scored[index] = types.SimpleNamespace(
+            index=index,
+            ok=True,
+            errors={},
+            scores={
+                "posterior.study.elpd_holdout": float(pointwise.sum()),
+                "posterior.study.pointwise_holdout_incidence": tuple(pointwise[:16]),
+                "posterior.study.pointwise_holdout_prevalence": tuple(pointwise[16:]),
+            },
+        )
+    order = sorted(scored.values(), key=lambda e: -e.scores["posterior.study.elpd_holdout"])
+    against = driver.leads(order, "study")
+
+    assert against[order[0].index] == "ref"
+    # the near-tie: a lead no bigger than its own error
+    runner_up, _, se = against[order[1].index].partition("+-")
+    assert abs(float(runner_up)) <= float(se)
+    # the real gap: many times its own error
+    last, _, se = against[order[2].index].partition("+-")
+    assert abs(float(last)) > 4.0 * float(se)
+
+
+def test_the_table_pairs_on_the_split_it_ranks_on():
+    """Two constants that would be a silent bug if they ever disagreed."""
+    assert driver.RANK == f"posterior.{driver.RANKED_SPLIT}.elpd_holdout"
+    assert driver.RANKED_SPLIT in data.SPLITS
 
 
 def test_missing_inputs_are_reported_once_by_name(tmp_path):
@@ -97,7 +166,7 @@ def tables(tmp_path_factory):
     """A synthetic study table and EIR prior table.
 
     Two studies, two sites each, incidence and microscopy prevalence in four age
-    brackets. No incidence cell straddles 5y, so both splits are coherent.
+    brackets.
     """
     import pandas as pd
 
@@ -280,7 +349,7 @@ def bench_tables(tmp_path_factory):
 
     The `tables` fixture has two, which is one fewer than `n_studies` defaults
     to. Five studies, two sites each, four brackets, both streams: 80 rows, of
-    which the two folds between them leave 16.
+    which the study fold leaves 32.
     """
     import pandas as pd
 
@@ -318,10 +387,9 @@ def bench_env(bench_tables, monkeypatch):
     for name, value in {
         "MALARIA_TABLE": str(table),
         "MALARIA_EIR_PRIORS": str(eir),
-        "MALARIA_SPLITS": "study,age_band",
+        "MALARIA_SPLITS": "study",
         "MALARIA_HOLDOUT_SEED": "42",
         "MALARIA_N_STUDIES": "3",
-        "MALARIA_FROM_AGE": "5.0",
     }.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("MALARIA_MORTALITY", raising=False)
@@ -330,12 +398,11 @@ def bench_env(bench_tables, monkeypatch):
 
 
 @needs_msinf
-def test_the_bench_hides_every_row_either_fold_holds_out(bench_env, bench_tables):
+def test_the_bench_hides_every_row_the_fold_holds_out(bench_env, bench_tables):
     """The property the whole module exists for.
 
-    Both folds, because a run that fits both puts both `elpd_holdout` numbers in
-    the report: a row behind either of them is a row the proposer must not have
-    measured.
+    A row behind the `elpd_holdout` in the report is a row the proposer must not
+    have measured -- and every other row is one it must still be able to see.
     """
     import pandas as pd
     from msinf.splits import Split, held_out_studies
@@ -347,20 +414,12 @@ def test_the_bench_hides_every_row_either_fold_holds_out(bench_env, bench_tables
 
     df, _, _ = bench_env.build()
     assert not df["study_index"].isin(dropped).any()
-    assert (df["age0"] < 5.0).all()
-    # and nothing else was lost: what is left is exactly the complement
-    kept = whole[~whole["study_index"].isin(dropped) & (whole["age0"] < 5.0)]
+    # and nothing else was lost: what is left is exactly the complement. The
+    # whole age range included -- hiding the held-out studies is the only thing
+    # the bench does, now that no fold cuts on age.
+    kept = whole[~whole["study_index"].isin(dropped)]
     assert len(df) == len(kept)
-
-
-@needs_msinf
-def test_a_single_split_run_hides_only_that_split(bench_env, monkeypatch):
-    """`--splits age_band` is a different question, and hides a different fold."""
-    monkeypatch.setenv("MALARIA_SPLITS", "age_band")
-    df, _, _ = bench_env.build()
-    assert (df["age0"] < 5.0).all()
-    # every study survives: only the study split drops whole studies
-    assert set(df["study_index"]) == {1, 2, 3, 4, 5}
+    assert df["age0"].max() == kept["age0"].max()
 
 
 @needs_msinf

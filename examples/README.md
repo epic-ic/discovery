@@ -216,24 +216,58 @@ top. That is not a failure -- it is the empirical ceiling on held-out
 likelihood, and it is the number the mechanistic candidates should be judged
 against.
 
-### The splits
+### The split
 
-Two, reported separately and **never averaged**, because they answer different
-questions and `msinf.splits` owns both:
+One: `study`, three whole studies dropped from the fit and scored on. It is the
+ranked score, and it is worth being explicit about what it is blunt about. A
+held-out study's `log_eir` sits on its prior (sd 0.3-0.8 on the log scale), so a
+large part of the number is how a candidate behaves when transmission intensity
+is known only to within a wide prior -- scaffolding every candidate shares. At
+the default seed the fold is studies {2, 10, 11}: 42 rows, **16 incidence cells
+plus 19 prevalence rows = 35 scoring units**. That separates working candidates
+from broken ones cleanly (run 04: -193 against -310) and orders the top few much
+less confidently -- they sat within 20 nats of each other.
 
-* `study` -- whole studies dropped. A held-out study's `log_eir` sits on its
-  prior (sd 0.3-0.8 on the log scale), so the fold can cost more than a
-  candidate does. Reported, not ranked on.
-* `age_band` -- every band from 5y up, in every study. `log_eir` stays informed
-  by the study's training rows, so what is tested is age structure -- which is
-  what a model of acquired immunity actually claims to explain. This is the
-  ranked score.
+Which is what the table's **`vs best`** column is for: the paired difference
+against the top row and its standard error, in nats. Pairing rather than
+comparing two totals, because both candidates were scored on the same units and
+a unit that is hard for one is hard for both -- differencing removes that shared
+difficulty and typically cuts the error to a third. A lead smaller than about
+twice its error is not a lead. The per-unit vectors it is computed from are
+`<split>.pointwise_holdout_*`, and `estimators.elpd_diff` does the arithmetic.
 
-Neither split is drawn here. Which rows can be scored apart from which is a
+What no arithmetic over one fold can recover is *which* studies were drawn into
+it. That is the larger uncertainty here and it takes more folds, not a better
+error bar -- see the note on leave-one-study-out below.
+
+`age_band` used to be here, and was the ranked score. It is a better question --
+it leaves `log_eir` informed and so tests age structure rather than transmission
+-- but not one this table can be asked. An incidence cell is a
+(site, age_bracket) pair and 43 of the 76 cells span more than one `age0`, so
+nearly every boundary cuts a cell in half and `msinf.splits` refuses it. The only
+legal interior cuts are 2y, which holds out 71% of the rows and leaves the fit
+training on infants alone, and 15y, which holds out 19 rows. The 5y this example
+defaulted to was refused outright. `msinf` still supports the kind for its own
+experiments; this example no longer offers it.
+
+The split is not drawn here. Which rows can be scored apart from which is a
 property of the likelihood: no incidence cell may straddle the boundary, because
 `v_jk` is integrated out at the cell level and the marginal is a joint density
 over the whole cell; and site indices renumber the moment a study is dropped.
 `data.py` names a split, `msinf` draws it and refuses an incoherent one.
+
+**Not done yet: leave-one-study-out.** One fold of three studies out of fourteen
+is one draw, and searching many candidates against it eventually fits the
+idiosyncrasies of studies {2, 10, 11}. The fix is more folds rather than a bigger
+fold, and they are nearly free: `msinf.model` builds the fitted likelihood as
+`mix_over_nodes(sum_by_study(...))`, so the training log-density already
+decomposes exactly into fourteen per-study terms and PSIS-LOO over them gives
+leave-one-study-out across all fourteen from a *single* fit, plus a Pareto k̂ per
+study naming the influential ones. Two caveats. Dropping one of fourteen studies
+is a large perturbation, so expect some k̂ > 0.7, whose only honest remedy is a
+refit. And PSIS leaves the held-out study's `log_eir` informed, so it estimates
+the predictive *conditional on transmission* — a different question from the
+study fold, and closer to the one `age_band` used to ask.
 
 ### The gates
 
@@ -262,9 +296,11 @@ not be measuring what the report claims.
 | metric | what it answers |
 | --- | --- |
 | `<split>.elpd_holdout`, `_incidence`, `_prevalence` | held-out density with the random effects marginalised exactly as the fitted likelihood marginalises them. Prevalence is scored per row; incidence per **cell**, since `v_jk` does not factorise. `_per_cell` and `_per_row` are the same numbers per unit. |
+| `<split>.elpd_holdout_se` | that total's standard error over its units, so a total is not read as if it were exact. |
+| `<split>.pointwise_holdout_*` | the per-unit vectors the totals sum, in the fold's own order — the only vector-valued metrics here. Two candidates under the same split line up elementwise, which is what lets the table's `vs best` column pair them. |
 | `<split>.coverage90_holdout_*` | how often the held-out count fell inside the 90% predictive interval. |
 | `<split>.kl.<parameter>`, `kl_min`, `unidentified` | the information the data added to each of the *candidate's own* parameters, in nats, unconstrained. The scaffolding's parameters are excluded: they are identical for every candidate and counting them would flatter a model that declared nothing. |
-| `rhat_max`, `ess_tail_min`, `divergences` | the worst of the splits, not the average: a candidate that converged under one fold and not the other has not converged. |
+| `rhat_max`, `ess_tail_min`, `divergences` | the worst of the splits, not the average: a candidate that converged under one fold and not another has not converged. |
 | `mcmc_seconds`, `total_seconds`, `parameters` | what it cost, and how much of it the candidate declared. |
 
 Prior draws for the identifiability comparison are taken with the candidate's

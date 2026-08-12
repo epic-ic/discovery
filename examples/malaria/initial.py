@@ -197,20 +197,21 @@ slides examined). Sites differ enormously in transmission intensity, and the
 site's annual EIR is a latent parameter with an informative prior, not something
 you are given.
 
-Held-out scoring, two splits, reported separately and never averaged:
+Held-out scoring, one split:
 
-  study     -- {study} whole studies are dropped from the fit. A held-out
-               study's EIR sits on its prior, so this split is blunt: it can be
-               dominated by EIR uncertainty rather than by your model.
-  age_band  -- every age band from {from_age:g}y up is dropped, in every study.
-               The remaining rows still inform each site's EIR, so what this
-               tests is age structure -- which is what a model of acquired
-               immunity actually claims to explain. It is the number to watch.
+  study     -- {study} whole studies are dropped from the fit, and your model is
+               scored on their rows. Know what this is blunt about: a held-out
+               study's EIR sits on its prior rather than being informed by its
+               own data, so a good part of the number is how your curves behave
+               when transmission intensity is only known to within a wide prior.
+               That is shared by every candidate. What separates candidates is
+               age structure, and it is the smaller part of this number -- so a
+               small lead over another candidate is not a real one.
 
 The fit is NUTS in numpyro at f64, {chains} chains, {warmup} warmup and {samples}
-post-warmup draws, once per split, the same budget for every candidate. One fit
-takes roughly {minutes:.0f} minutes, so a candidate that is much more expensive
-to solve will be killed rather than scored.
+post-warmup draws, the same budget for every candidate. One fit takes roughly
+{minutes:.0f} minutes, so a candidate that is much more expensive to solve will
+be killed rather than scored.
 
 Scored on held-out predictive likelihood with the study random effects
 integrated out, on whether the predictive intervals cover the held-out counts,
