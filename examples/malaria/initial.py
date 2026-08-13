@@ -52,15 +52,21 @@ Nothing here is a string literal holding candidate source, and nothing about the
 incumbent is transliterated. Each start is a real module under `starts/` whose
 marked regions are lifted out with `discovery.model`'s own block parser, and every
 piece of the mechanism is `inspect.getsource` from `dmeq` -- so what a proposer
-reads is byte for byte what the fit runs and cannot drift from it. The one
-exception is `DRIVER`, 25 hand-written lines standing in for `dmeq._solve`, and
-`test_the_incumbent_candidate_agrees_with_msinfs_own_model` is what stops it
-drifting. All of this is cheap only because `import dmeq` imports no array library
-and `getsource` executes nothing.
+reads is byte for byte what the fit runs and cannot drift from it. The incumbent's
+parameter block is the same idea one step removed: it is rendered by
+`griffin_parameters` from `msinf`'s own `PriorSpec`s rather than copied, because a
+proposer that cannot see a prior's family and scale cannot judge what to keep.
+The one real exception is `DRIVER`, 25 hand-written lines standing in for
+`dmeq._solve`, and `test_the_incumbent_candidate_agrees_with_msinfs_own_model` is
+what stops it drifting -- it pins the rendered priors too. All of this is cheap
+only because `import dmeq` imports no array library and `getsource` executes
+nothing.
 """
 
 from inspect import getsource
 from textwrap import dedent, indent
+
+from msinf.config import resolve_priors
 
 from discovery.model import Model
 
@@ -543,17 +549,127 @@ def griffin_mechanism(target: str) -> str:
     return "\n\n".join(parts)
 
 
-def assemble(target: str, module, mechanism: str | None = None) -> str:
+#: the incumbent's sampled parameters, grouped by which of the three
+#: probabilities they move and in the order `griffin_immunity` reaches them. The
+#: grouping is the only editorial thing in the rendered block, and it is read off
+#: the extracted mechanism sitting a few hundred lines below it.
+GRIFFIN_PARAM_GROUPS = (
+    ("b, the probability an infectious bite infects, through IB", ("b0", "IB0", "kb", "ub")),
+    (
+        "phi, the probability an infection becomes a clinical episode, through IC",
+        ("phi0", "phi1", "IC0", "kc", "uc", "PM", "dm"),
+    ),
+    (
+        "q, the probability an asymptomatic infection is seen by microscopy, through ID",
+        ("d1", "ID0", "kd", "ud", "fd0", "ad0", "gd"),
+    ),
+)
+
+#: the two parameters whose prior is not on the scale the ODE reads them at. Both
+#: are unguessable from the number alone, and one of them is why the block ends
+#: with a multiplication.
+GRIFFIN_PARAM_UNITS = {"ad0": "years", "dm": "days"}
+
+#: `msinf.config.sample_param`'s dispatch, as the literal call it makes. Rendering
+#: the call rather than making it is the whole point: a proposer that cannot see
+#: the family and its arguments cannot judge what to keep, and cannot pick a prior
+#: for anything it adds.
+PRIOR_CALLS = {"beta": "dist.Beta", "lognormal": "dist.LogNormal"}
+
+
+def prior_line(spec) -> tuple[str, str]:
+    """One sampled parameter as code and as the comment that says where it lives.
+
+    Split in two so the caller can align the comments into a column; a prior is
+    two numbers whose meaning is a support and a scale, and a column of medians is
+    how that gets read at a glance rather than reconstructed.
+    """
+    call = PRIOR_CALLS.get(spec.family)
+    if call is None:
+        raise ValueError(f"unsupported family for {spec.name}: {spec.family}")
+
+    def g(value: float) -> str:
+        return f"{value:.3g}"
+
+    code = f'{spec.name}=sample("{spec.name}", {call}({spec.param1!r}, {spec.param2!r})),'
+    unit = GRIFFIN_PARAM_UNITS.get(spec.name)
+    comment = f"# median {g(spec.median)}, 95% ({g(spec.p2_5)}, {g(spec.p97_5)})"
+    return code, comment + (f" -- {unit}" if unit else "")
+
+
+def griffin_parameters() -> str:
+    """The incumbent's parameter block, rendered from `msinf`'s own prior specs.
+
+    Written out rather than looked up. `resolve_priors("xi")` and `sample_param`
+    keep this model and the one msinf fits from disagreeing, but they do it by
+    putting the priors behind two calls whose source is not on the page -- so a
+    proposer reads eighteen names and learns nothing about the space they live in:
+    not which are probabilities and which are positive reals, not that `IB0` is
+    O(20) while `kb` is O(1), not that `dm` is in days, and not how to declare a
+    parameter of its own. That is not a search problem, it is a legibility one,
+    and `scratch` does not have it: its three priors are literals.
+
+    So the numbers come out of `msinf.priors` and go onto the page as the calls
+    `sample_param` would have made. The single source of truth is unchanged --
+    this is generated from it, in the same way the mechanism is `getsource` from
+    `dmeq` -- and `test_the_incumbent_candidate_declares_the_same_parameters` is
+    what holds the rendering to it.
+    """
+    priors = resolve_priors("xi")
+    rendered = [
+        (heading, [prior_line(priors[name]) for name in names])
+        for heading, names in GRIFFIN_PARAM_GROUPS
+    ]
+    width = max(len(code) for _, lines in rendered for code, _ in lines)
+
+    body = []
+    for heading, lines in rendered:
+        body.append(f"        # {heading}")
+        body += [f"        {code:<{width}}  {comment}" for code, comment in lines]
+    return PARAMETERS_BLOCK.replace("@@PRIORS@@", "\n".join(body))
+
+
+#: the incumbent's parameter block with its priors left out, because they are
+#: generated. Everything around them is fixed prose about what the block is for.
+PARAMETERS_BLOCK = '''\
+    # Xi's refit priors, written out. The numbers are generated from the specs in
+    # `msinf.priors`, so this model and the one msinf fits cannot disagree about
+    # them; they are on the page rather than behind a lookup so that what the
+    # incumbent samples can be read, and so that a candidate adding a parameter of
+    # its own has the idiom in front of it. Each trailing comment is the prior's
+    # median and its 95% interval.
+    #
+    # Every one of these is read by the immunity model and none by the equilibrium
+    # state solve, which is why the two targets sample exactly the same thing and
+    # their scores are comparable. Nothing requires a candidate to keep them: they
+    # are the incumbent's parameterization, not the solve's.
+    params = dict(default_parameters())
+    params.update(
+@@PRIORS@@
+    )
+    # The Griffin parameterization keeps ad0 -- the age at which the detection
+    # half-point has fallen halfway -- on a years scale in the prior. The ODE
+    # wants days.
+    params["ad0"] = params["ad0"] * 365.0
+    return params'''
+
+
+def assemble(
+    target: str, module, mechanism: str | None = None, parameters: str | None = None
+) -> str:
     """A start module spliced into its target's template.
 
-    `mechanism` overrides the module's own block, which is how the incumbent comes
-    out of `dmeq` rather than out of `starts/` -- `starts/griffin.py` carries the
-    parameter block and the imports and no mechanism at all, because there is
-    nothing about the incumbent's mechanism worth writing by hand.
+    `mechanism` and `parameters` override the module's own blocks, which is how
+    the incumbent comes out of `dmeq` and `msinf` rather than out of `starts/` --
+    `starts/griffin.py` carries the imports and nothing else, because there is
+    nothing about the incumbent worth writing by hand and a hand copy could drift
+    from what it is actually fitted with.
     """
     blocks = regions(module)
     if mechanism is not None:
         blocks[MECHANISM[target]] = mechanism
+    if parameters is not None:
+        blocks[PARAMETERS] = parameters
 
     missing = [name for name in (PARAMETERS, MECHANISM[target]) if name not in blocks]
     if missing:
@@ -580,9 +696,13 @@ START_NAMES = ("scratch", "griffin")
 #: here rather than an hour into a run.
 STARTS: dict[tuple[str, str], str] = {
     ("curves", "scratch"): assemble("curves", curves_scratch),
-    ("curves", "griffin"): assemble("curves", griffin, mechanism=griffin_mechanism("curves")),
+    ("curves", "griffin"): assemble(
+        "curves", griffin, griffin_mechanism("curves"), griffin_parameters()
+    ),
     ("immunity", "scratch"): assemble("immunity", immunity_scratch),
-    ("immunity", "griffin"): assemble("immunity", griffin, mechanism=griffin_mechanism("immunity")),
+    ("immunity", "griffin"): assemble(
+        "immunity", griffin, griffin_mechanism("immunity"), griffin_parameters()
+    ),
 }
 
 #: what the proposer is told about the run, alongside the model itself

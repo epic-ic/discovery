@@ -16,50 +16,26 @@ read off that.
 
 It is misspecified, and it is the thing to beat, not the thing to match.
 
-Everything below the parameter block is `dmeq`'s own source, extracted verbatim
-rather than restated, so what you are reading is what the incumbent is actually
-fitted with and not a paraphrase that could have drifted from it.
+Nothing below is written by hand. The mechanism is `dmeq`'s own source and the
+parameter block is rendered from `msinf`'s own prior specs, so what you are
+reading is what the incumbent is actually fitted with and not a paraphrase that
+could have drifted from it.
 """
 
-# This module holds only the parameter block and the imports, because there is
-# nothing about the incumbent's mechanism worth writing by hand: `initial.py` lifts
-# it out of `dmeq` with `inspect.getsource` at both targets. The docstring above
-# becomes the candidate's, so it describes the model rather than this file.
+# This module holds only the imports, because there is nothing about the incumbent
+# worth writing by hand: `initial.py` lifts the mechanism out of `dmeq` with
+# `inspect.getsource` at both targets, and renders the parameter block out of
+# `msinf.priors`. The docstring above becomes the candidate's, so it describes the
+# model rather than this file.
 
-# `backend` is unused *here* and required by the spliced mechanism, which is
-# `dmeq`'s source and not this module's -- see `starts/__init__.py` on why a start
-# is a fragment rather than a runnable model.
+# Everything here is unused *in this module* and required by the spliced blocks,
+# which are `dmeq`'s source and `initial.py`'s rendering and not this module's --
+# see `starts/__init__.py` on why a start is a fragment rather than a runnable
+# model. The rendered parameter block writes its priors as literal `sample` calls,
+# which is what puts `numpyro` in a preamble that used to import `msinf`.
 # ruff: noqa: F401
 # @discovery:begin preamble
+import numpyro.distributions as dist
 from dmeq import backend, default_parameters
-from msinf.config import resolve_priors, sample_param
+from numpyro import sample
 # @discovery:end
-
-
-def parameters():
-    """The Griffin parameter block: the dmeq defaults with the sampled ones over.
-
-    Everything the block needs is inside it, priors and names included, because
-    both targets splice this same block and a block that reached for a
-    module-level constant would not travel.
-    """
-    # @discovery:begin parameters
-    # Xi's refit priors, by name. The constants live in `msinf.priors` so that
-    # this model and the one msinf fits cannot disagree about them.
-    priors = resolve_priors("xi")
-    # The dmeq parameters the fit samples. Every one of them is read by the
-    # immunity model and none by the equilibrium state solve, which is why the two
-    # targets sample exactly the same thing and their scores are comparable.
-    names = (
-        "b0", "phi0", "phi1", "d1", "PM", "fd0", "ID0", "kd", "ud", "ad0",
-        "gd", "IB0", "kb", "ub", "IC0", "kc", "uc", "dm",
-    )
-    sampled = {name: sample_param(name, priors[name]) for name in names}
-    params = dict(default_parameters())
-    params.update(sampled)
-    # The Griffin parameterization keeps ad0 -- the age at which the detection
-    # half-point has fallen halfway -- on a years scale in the prior. The ODE
-    # wants days.
-    params["ad0"] = params["ad0"] * 365.0
-    return params
-    # @discovery:end
