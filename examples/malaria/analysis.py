@@ -14,26 +14,27 @@ Today `data.SPLITS` is the study fold alone, so the union is that one fold's
 rows -- roughly 19% of the table at the default seed, leaving the proposer 181
 of 223 rows across the full 0-20y range.
 
-**numpy and pandas only, and it is worth some duplication to keep it that way.**
-No jax, no numpyro, no dmeq, and no candidate is executed here. Nothing a
-proposer wants before it writes a model needs a backend, and importing one costs
-gigabytes of address space per worker for a couple of hundred megabytes of
-working set -- so the pool stays as cheap as birthdates'. The gates in `gates.py`
-do run a candidate's curves, but they run in the fit subprocess where jax already
-lives, and they run whether the proposer looked or not: a candidate that ignores
-them costs a `GateError`, not a fit.
+**numpy and pandas only.** No jax, no numpyro, and no candidate is executed
+here. Nothing a proposer wants before it writes a model needs a backend, and
+importing one costs gigabytes of address space per worker for a couple of
+hundred megabytes of working set -- so the pool stays as cheap as birthdates'.
+The gates in `gates.py` do run a candidate's curves, but they run in the fit
+subprocess where jax already lives, and they run whether the proposer looked or
+not: a candidate that ignores them costs a `GateError`, not a fit.
 
-What that costs is `age_proportions` and one constant, reimplemented below in
-numpy because `dmeq` is jax and that recursion is the one thing here that
-genuinely needs it. `tests/test_malaria.py` pins both against dmeq, in the same
-spirit as the pin on `initial.GRIFFIN` -- a duplicated formula that nothing
-compares is a formula that will drift.
+`dmeq` is imported, and that is not a contradiction: since its backend split it
+imports no array library at all until one is selected, and `build` selects numpy
+for the duration of the call. So the demography here is `dmeq.age_proportions`
+itself rather than a copy of it -- the recursion the fit weights by, run on the
+backend this worker can afford. What used to be reimplemented below, and pinned
+against dmeq by `tests/test_malaria.py` to stop it drifting, is now the same
+function and cannot drift.
 
-Nothing else is copied. Everything that reads a table -- the study rows, the EIR
-and `ft` priors, the splits, and the per-site WPP death rates the fit will weight
-by -- comes from `msinf`, which is pandas throughout; `msinf.age_grid` and
-`msinf.demography` now defer their jax-touching imports into the functions that
-need them, so importing a reader does not start a backend. The bench therefore
+Nothing is copied. Everything that reads a table -- the study rows, the EIR and
+`ft` priors, the splits, and the per-site WPP death rates the fit will weight by
+-- comes from `msinf`, which is pandas throughout; `msinf.age_grid` and
+`msinf.demography` defer their jax-touching imports into the functions that need
+them, so importing a reader does not start a backend. The bench therefore
 resolves the *same* demography the fit resolves, rather than showing a uniform
 one and hoping nobody notices.
 
@@ -119,47 +120,6 @@ microscopy prevalence, and those are the two things a candidate is scored on.
 #: the study table's observation type codes, as `msinf.model` names them
 STREAMS = {1: "incidence", 2: "prevalence"}
 
-#: dmeq's default per-day death rate -- `default_parameters()["eta"]`, a mean
-#: lifetime of about 21 years. Written out rather than imported because
-#: importing dmeq imports jax. It is the rate every run that predates the WPP
-#: mortality tables used, and `runner.py` still uses it whenever `--mortality`
-#: is unset, which is every run so far.
-DEATH_RATE = 1.305e-4
-
-
-def age_proportions(ages, mu):
-    """Equilibrium fraction of the population in each age class.
-
-    `dmeq.age_proportions` in numpy. The recursion is the one in
-    malariasimulation's `get_equilibrium_population`: inflow from the class
-    below over the outflow of ageing plus death,
-
-        pop[0] = 1 / (r[0] + mu[0])
-        pop[i] = pop[i-1] * r[i-1] / (r[i] + mu[i])
-
-    normalised at the end, so the birth rate cancels. `r` is the per-day rate of
-    ageing out of a class, `1/width`, and zero in the terminal class, which is
-    absorbing and whose death rate is therefore its only outflow.
-
-    Written as a `cumprod` rather than a loop, which is a different association
-    of the same products: it agrees with dmeq to about 1e-15 relative at f64 and
-    is not bitwise equal. That is the right bar here -- this array is read, and
-    never enters a likelihood.
-    """
-    import numpy as np
-
-    ages = np.asarray(ages, dtype=np.float64)
-    mu = np.broadcast_to(np.asarray(mu, dtype=np.float64), ages.shape)
-    if not mu[-1] > 0.0:
-        raise ValueError(
-            "the terminal age class must have a strictly positive death rate: "
-            "it is absorbing, so death is the only way out of it"
-        )
-    rate = np.append(1.0 / np.diff(ages * 365.0), 0.0)
-    pop = np.concatenate([[1.0], np.cumprod(rate[:-1] / (rate[1:] + mu[1:]))]) / (rate[0] + mu[0])
-    return pop / pop.sum()
-
-
 #: the frame and the demography, built once per worker rather than once per
 #: snippet. The table is a few thousand rows and rebuilding it every call would
 #: be affordable, but the split has to be drawn identically every time and
@@ -184,10 +144,11 @@ def build() -> tuple:
     it is the package that defines which rows can be scored apart from which, it
     refuses a split that straddles an incidence cell, and a second way to draw
     the same fold is a second way to draw it differently. The same goes for the
-    mortality table: `msinf.demography` reads it, and only the recursion that
-    turns death rates into an age distribution is written out here.
+    mortality table, which `msinf.demography` reads, and for the recursion that
+    turns those rates into an age distribution, which is `dmeq`'s.
     """
     import numpy as np
+    from dmeq import age_proportions, default_parameters, use_backend
     from msinf.age_grid import age_grid_array
     from msinf.data import (
         encode_canonical_sites,
@@ -257,8 +218,15 @@ def build() -> tuple:
         # Only the recursion it feeds is reimplemented here.
         mu = load_site_death_rates(df=frame, mortality_csv=mortality, n_site=n_site, ages=ages)
     else:
-        mu = uniform_death_rates(n_site, int(ages.shape[0]), rate=DEATH_RATE)
-    prop = np.stack([age_proportions(ages, row) for row in mu], axis=0)
+        # dmeq's default per-day death rate: a mean lifetime of about 21 years.
+        # The rate every run that predates the WPP mortality tables used, and
+        # what `runner.py` still uses whenever `--mortality` is unset.
+        mu = uniform_death_rates(n_site, int(ages.shape[0]), rate=default_parameters()["eta"])
+    # `use_backend` rather than `set_backend`: this runs in an analysis worker,
+    # but it is also imported by the test suite, where a fit elsewhere in the
+    # interpreter has every right to still be on jax.
+    with use_backend("numpy"):
+        prop = np.stack([np.asarray(age_proportions(ages, row)) for row in mu], axis=0)
     return train, ages, prop
 
 

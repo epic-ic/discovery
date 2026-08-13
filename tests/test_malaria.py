@@ -522,11 +522,17 @@ def test_a_wpp_mortality_table_is_resolved_the_way_the_fit_resolves_it(
 
 @needs_msinf
 def test_the_bench_never_imports_jax(bench_tables):
-    """The reason `age_proportions` is duplicated at all.
+    """What the whole module is arranged around.
 
     A subprocess, because this interpreter has almost certainly imported jax by
     the time the rest of the file has run. Four analysis workers each reserving
     gigabytes of address space for a backend nothing uses is what this buys off.
+
+    `dmeq` is in the probe and expected to be absent for a different reason from
+    the others: `build` imports it, so this asserts that importing it did not
+    drag in a backend -- the property dmeq's numpy path exists to provide. The
+    demography here is dmeq's own function, not a copy, and it still costs no
+    jax.
     """
     import subprocess
 
@@ -545,52 +551,23 @@ def test_the_bench_never_imports_jax(bench_tables):
         cwd=str(Path(__file__).resolve().parent.parent),
     )
     assert done.returncode == 0, done.stderr
-    assert done.stdout.strip().endswith("[]"), done.stdout
+    assert done.stdout.strip().endswith("['dmeq']"), done.stdout
 
 
 @needs_msinf
-def test_the_benchs_age_proportions_agree_with_dmeq(f64):
-    """The pin on the one formula this module copies.
+def test_an_absorbing_terminal_class_is_refused():
+    """With no ageing out and no death, the terminal class accumulates everyone.
 
-    A duplicated formula that nothing compares is a formula that will drift, and
-    a demography that disagrees with the one the likelihood weights by would
-    have an agent reasoning about a different population from the one being
-    fitted. Not bitwise: the copy is a `cumprod` where dmeq scans, which is a
-    different association of the same products.
+    dmeq's own guard, checked on the backend the bench runs it on: a traced `mu`
+    under jax cannot be inspected and the check is skipped, but numpy values are
+    always concrete, so in an analysis worker this always fires.
     """
     import numpy as np
-    from dmeq import age_proportions
-    from msinf.age_grid import age_grid_array
-
-    from examples.malaria import analysis
-
-    ages = age_grid_array(dtype=np.float64)
-    for name, mu in (
-        ("uniform", np.full(ages.shape, analysis.DEATH_RATE)),
-        ("rising with age", analysis.DEATH_RATE * (1.0 + np.linspace(0.0, 3.0, ages.size) ** 2)),
-    ):
-        theirs = np.asarray(age_proportions(ages, mu, dtype=np.float64))
-        ours = analysis.age_proportions(ages, mu)
-        assert np.allclose(ours, theirs, rtol=1e-12, atol=0.0), name
-
-
-@needs_msinf
-def test_the_benchs_death_rate_is_dmeqs_default(f64):
-    """The other copied constant. `prop` is wrong everywhere if this drifts."""
-    from dmeq import default_parameters
-
-    from examples.malaria import analysis
-
-    assert analysis.DEATH_RATE == pytest.approx(float(default_parameters()["eta"]), rel=1e-12)
-
-
-@needs_msinf
-def test_an_absorbing_terminal_class_is_refused(bench_env):
-    """dmeq raises here too: with no ageing out and no death, it accumulates everyone."""
-    import numpy as np
+    from dmeq import age_proportions, default_parameters, use_backend
 
     ages = np.linspace(0.0, 100.0, 20)
-    mu = np.full(ages.shape, bench_env.DEATH_RATE)
+    mu = np.full(ages.shape, float(default_parameters()["eta"]))
     mu[-1] = 0.0
-    with pytest.raises(ValueError, match="absorbing"):
-        bench_env.age_proportions(ages, mu)
+    with use_backend("numpy"):
+        with pytest.raises(ValueError, match="absorbing"):
+            age_proportions(ages, mu)
