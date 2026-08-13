@@ -83,6 +83,22 @@ removed, and no amount of looking will reveal them:
                         its sites with it. Where no mortality table is
                         configured every site has the same exponential age
                         distribution and every row is identical
+    grid                the same age grid as dmeq's AgeGrid: `days` and `years`
+                        (class edges), `midpoints` and `widths` in days, `ageing`
+                        (the per-day rate of ageing out of each class) and
+                        `age20` (the index of the class whose midpoint is nearest
+                        20 years). What an immunity recursion over age is written
+                        against
+    re                  the per-day rate of leaving an age class by ageing or
+                        death, one row per site like `prop`. Ageing plus that
+                        site's mortality: the rate that damps a recursion over
+                        age, so it belongs to any curve that accumulates
+    eps                 the per-day EIR each age class experiences at the site's
+                        prior central EIR, one row per site. The site's annual
+                        `eir` over 365, scaled by the age-dependent relative
+                        biting rate -- children are bitten less -- and *not* by
+                        the heterogeneity quadrature, which the model integrates
+                        over and this does not
     np, pd              numpy and pandas
 
 Four things to know before reading a number off this table.
@@ -115,6 +131,12 @@ what earns a better held-out likelihood.
 
 Nothing here observes PCR prevalence. The table carries clinical incidence and
 microscopy prevalence, and those are the two things a candidate is scored on.
+
+`grid`, `re` and `eps` are the arguments an `immunity` block is handed, so that
+target's arithmetic can be tried here on the shape you are considering. They are
+inputs and not answers: `eps` is built from the *prior* central EIR, which the fit
+moves, and no candidate is run in this bench -- the gates do that, in the fit,
+where a backend is already paid for.
 """
 
 #: the study table's observation type codes, as `msinf.model` names them
@@ -138,7 +160,7 @@ def splits() -> tuple[str, ...]:
 
 
 def build() -> tuple:
-    """`(df, ages, prop)`: every row no fold of this run holds out, and the demography.
+    """`(df, ages, prop, grid, re, eps)`: the rows no fold holds out, and the fixed inputs.
 
     The masks come from `msinf.splits` rather than from a reimplementation here:
     it is the package that defines which rows can be scored apart from which, it
@@ -148,7 +170,7 @@ def build() -> tuple:
     turns those rates into an age distribution, which is `dmeq`'s.
     """
     import numpy as np
-    from dmeq import age_proportions, default_parameters, use_backend
+    from dmeq import age_grid, age_proportions, default_parameters, use_backend
     from msinf.age_grid import age_grid_array
     from msinf.data import (
         encode_canonical_sites,
@@ -222,12 +244,37 @@ def build() -> tuple:
         # The rate every run that predates the WPP mortality tables used, and
         # what `runner.py` still uses whenever `--mortality` is unset.
         mu = uniform_death_rates(n_site, int(ages.shape[0]), rate=default_parameters()["eta"])
+    # The per-site prior central EIR, averaged over the raw site indices a
+    # canonical site aggregates -- the same way `load_eir_prior_table` averages
+    # them -- and spanning every site in the table, like `prop`.
+    site_eir = (
+        frame[["site_i", "site_index"]]
+        .drop_duplicates()
+        .merge(eir[["site_index", "eir_estimate"]], on="site_index", how="left")
+        .groupby("site_i")["eir_estimate"]
+        .mean()
+        .reindex(range(n_site))
+        .to_numpy(dtype=float)
+    )
+
     # `use_backend` rather than `set_backend`: this runs in an analysis worker,
     # but it is also imported by the test suite, where a fit elsewhere in the
     # interpreter has every right to still be on jax.
     with use_backend("numpy"):
         prop = np.stack([np.asarray(age_proportions(ages, row)) for row in mu], axis=0)
-    return train, ages, prop
+        grid = age_grid(ages)
+
+    # The two other things an immunity block is handed, built the way `dmeq`
+    # builds them rather than the way this module would: the rate of leaving an
+    # age class is ageing plus that site's mortality, and the EIR each class
+    # experiences is the site's annual rate over 365 times the age-dependent
+    # relative biting rate. The heterogeneity quadrature is deliberately not in
+    # `eps` -- the model integrates over it and a single curve cannot show it.
+    defaults = default_parameters()
+    re = np.asarray(grid.ageing)[None, :] + mu
+    psi = 1.0 - defaults["rho"] * np.exp(-np.asarray(grid.midpoints) / defaults["a0"])
+    eps = (site_eir[:, None] / 365.0) * psi[None, :]
+    return train, ages, prop, grid, re, eps
 
 
 def namespace() -> dict:
@@ -248,5 +295,16 @@ def namespace() -> dict:
 
     if _BUILT is None:
         _BUILT = build()
-    train, ages, prop = _BUILT
-    return {"df": train.copy(), "ages": ages.copy(), "prop": prop.copy(), "np": np, "pd": pd}
+    train, ages, prop, grid, re, eps = _BUILT
+    return {
+        "df": train.copy(),
+        "ages": ages.copy(),
+        "prop": prop.copy(),
+        # a NamedTuple has no `copy`, and handing out the same arrays every time
+        # would let one snippet's mutation reach the next one
+        "grid": type(grid)(*(np.copy(field) for field in grid)),
+        "re": re.copy(),
+        "eps": eps.copy(),
+        "np": np,
+        "pd": pd,
+    }

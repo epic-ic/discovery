@@ -68,19 +68,35 @@ def read_config() -> dict[str, Any]:
     return json.loads(sys.stdin.read())
 
 
-def compile_provider(source: str):
-    """Run the candidate's source and hand back its `(parameters, curves)`.
+def compile_candidate(source: str) -> dict[str, Any]:
+    """Run the candidate's source and hand back its module globals.
 
-    The source is a module: it does its own imports, defines its own helpers, and
-    must leave two callables behind. Two rather than one because `vmap` forces
-    it -- NumPyro sample sites cannot be created inside the `vmap` over sites.
+    The globals and not only the provider pair, because at the `immunity` target
+    the block the candidate wrote is not called by anything here: `curves` is the
+    template's and it reaches the candidate's `immunity` through `dmeq.solve`. The
+    only way to watch what the candidate wrote is to look it up by name and put
+    something in its place, which is what the portability gate does.
     """
     namespace: dict[str, Any] = {"__name__": "candidate"}
     exec(compile(source, "<candidate>", "exec"), namespace)  # noqa: S102 -- the point of the subprocess
+    return namespace
+
+
+def require_provider(namespace: dict[str, Any]):
+    """The candidate's `(parameters, curves)`, or a `TypeError` naming what is missing.
+
+    Two callables rather than one because `vmap` forces it -- NumPyro sample sites
+    cannot be created inside the `vmap` over sites.
+    """
     missing = [name for name in (PARAMETERS, CURVES) if not callable(namespace.get(name))]
     if missing:
         raise TypeError(f"the model source defines no callable {' or '.join(repr(m) for m in missing)}")
     return namespace[PARAMETERS], namespace[CURVES]
+
+
+def compile_provider(source: str):
+    """Compile a candidate and take its provider pair out of it."""
+    return require_provider(compile_candidate(source))
 
 
 def stub_curves(params, log_eir, ft, ages, prop, mu):
@@ -184,7 +200,8 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
     from examples.malaria import gates
 
     started = time.perf_counter()
-    parameters, curves = compile_provider(config["source"])
+    namespace = compile_candidate(config["source"])
+    parameters, curves = require_provider(namespace)
     provider = CurveProvider(parameters=parameters, curves=curves)
 
     cfg = NumpyroConfig(
@@ -227,6 +244,7 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
         draws=config["gate_draws"],
         seed=config["seed"],
         inc_max=config["inc_max"],
+        namespace=namespace,
     )
     if reasons:
         return {"gates": list(reasons), "metrics": {}, "artifacts": {}}

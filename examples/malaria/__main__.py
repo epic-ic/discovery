@@ -5,18 +5,30 @@
 msinf's observational model is held fixed -- the study random effects, the
 incidence and prevalence likelihoods, the site EIR priors, `ft_study`, the age
 grid, the demography, the age-bin averaging -- and what varies between
-candidates is only the curve provider: the map from parameters to prevalence and
-incidence over age. One round: ask N agents for a curve family, fit every
-proposal and the model it started from under the same NUTS budget, score them
-all, write the report.
+candidates is only the mechanism: the map from parameters to prevalence and
+incidence over age. One round: ask N agents for a block, fit every proposal and
+the model it started from under the same NUTS budget, score them all, write the
+report.
 
-Two starting models, and `--start both` is the point of the exercise. `scratch`
-is deliberately poor and asks what a search finds from nothing; `griffin` is the
-incumbent and asks whether a search seeded with a misspecified mechanism corrects
-it. Whichever wins, expect something flexible in age x EIR with no mechanism in
+`--target` says how much of the mechanism is on the table. It is one model with two
+apertures, not two models: `curves` opens the immunity model, the equilibrium state
+solve and the driver; `immunity` opens the `eps -> (foi, phi, q, b)` block alone and
+leaves the rest below it as fixed but readable text. The incumbent samples the same
+18 parameters either way, so its number is the same number at both targets, and a
+`curves` run is the empirical ceiling an `immunity` run's mechanistic candidates
+should be judged against.
+
+`--start` picks the one model the round rewrites. `scratch` is deliberately poor
+and asks what a search finds from nothing; `griffin` is the incumbent and asks
+whether a search seeded with a misspecified mechanism corrects it. One per run:
+comparing them means running both and reading the two reports, which the shell
+does better than an option here -- a single run that drew from both would double
+its own length and still keep the two rounds blind to each other, since they stop
+being that comparison the moment either can read the other's proposals.
+
+At `--target curves`, expect something flexible in age x EIR with no mechanism in
 it to be near the top: that is not a failure, it is the empirical ceiling on
-held-out likelihood, and it is the number the mechanistic candidates should be
-judged against.
+held-out likelihood.
 
 `--no-search` skips the language model and fits only the starting models, which
 is the fastest way to see the whole evaluation path work -- though "fastest" here
@@ -47,7 +59,7 @@ from examples.estimators import elpd_diff
 from examples.malaria import analysis as setup
 from examples.malaria import data
 from examples.malaria.fit import Budget, Posterior
-from examples.malaria.initial import BRIEF, STARTS
+from examples.malaria.initial import BRIEF, START_NAMES, STARTS, TARGETS
 
 #: the score models are ranked by, and the one number this example has to rank
 #: on -- see `data.SPLITS` for why the age-band split it used to rank on is gone.
@@ -111,12 +123,22 @@ def options(argv: list[str] | None = None) -> argparse.Namespace:
 
     start = parser.add_argument_group("what the search starts from")
     start.add_argument(
+        "--target",
+        choices=TARGETS,
+        default="curves",
+        help="curves: the whole solve, parameters -> (prev_m, inc) over age. "
+        "immunity: the eps -> (foi, phi, q, b) block alone, with the equilibrium "
+        "state solve and the demography fixed",
+    )
+    start.add_argument(
         "--start",
-        choices=(*STARTS, "both"),
-        default="both",
-        help="scratch: no immunity, no age structure. griffin: the incumbent, "
-        "for correction rather than discovery. both: one search from each, "
-        "sharing scaffolding, budget and scores exactly",
+        choices=START_NAMES,
+        default="scratch",
+        help="scratch: deliberately poor -- no immunity and no age structure at "
+        "the curves target, immunity that does not accumulate at the immunity "
+        "one. griffin: the incumbent, for correction rather than discovery. "
+        "One per run: the two are compared by running both and reading the two "
+        "reports, not by mixing them into one",
     )
 
     fit = parser.add_argument_group("fit, identical for every candidate")
@@ -161,12 +183,12 @@ async def propose(settings: argparse.Namespace, start: Model, brief: str, pool: 
     somebody who has looked at how prevalence moves with age and EIR is a better
     draw than one proposed blind.
 
-    `--start both` runs this twice, and the two rounds do not see each other --
-    the comparison is between what a search finds from nothing and what it finds
-    from the incumbent, and it stops being that comparison the moment either
-    round can read the other's proposals. The pool is shared across the two
-    rounds and carries nothing between them: every snippet gets a fresh
-    namespace, whoever asked for it.
+    One round per run, against one parent. Comparing the two starts means two
+    runs: the comparison is between what a search finds from nothing and what it
+    finds from the incumbent, and it stops being that comparison the moment either
+    round can read the other's proposals -- so there is nothing for a single run to
+    share between them except the fits, which are the expensive part and not the
+    part that would be saved.
     """
     decode = Decode(
         temperature=settings.temperature,
@@ -340,6 +362,7 @@ async def main(argv: list[str] | None = None) -> int:
     # nothing to run, and it is worth saying so once, up front.
     inputs = data.inputs(settings.table, settings.eir_priors, settings.mortality)
     summary = data.read(inputs.table)
+    print(f"target  {settings.target}")
     print(f"table   {summary}")
     for kind in splits:
         print(f"split   {data.label(kind, settings.holdout_seed, settings.n_studies)}")
@@ -357,10 +380,10 @@ async def main(argv: list[str] | None = None) -> int:
         inc_max=Budget.inc_max,
     )
 
-    # One pool for both rounds, booted before either of them so the first agent
-    # does not pay for the import, and closed once both are done. It is given
-    # the same table and the same fold the fit will use, and hides what that
-    # fold holds out -- see `analysis.py`.
+    # Booted before the round so the first agent does not pay for the import, and
+    # closed before the fits, which want every core. It is given the same table
+    # and the same fold the fit will use, and hides what that fold holds out --
+    # see `analysis.py`.
     pool = None
     if settings.analysis and not settings.no_search:
         pool = Analysis(
@@ -380,23 +403,22 @@ async def main(argv: list[str] | None = None) -> int:
         await pool.start()
         print(f"        {settings.analysis_workers} analysis workers, {settings.tool_budget} calls each")
 
-    chosen = tuple(STARTS) if settings.start == "both" else (settings.start,)
-    candidates: list[Model] = []
-    #: every candidate's parent, so a row says which search found it. The
-    #: starting models are their own parents, and are the rows marked `*`.
-    origin: dict[int, str] = {}
-    starts: set[int] = set()
+    name = settings.start
+    start_model = Model(STARTS[settings.target, name])
+    #: every candidate's parent, so a row says which search it came from. The
+    #: starting model is its own parent, and is the row marked `*`.
+    candidates: list[Model] = [start_model]
+    origin: dict[int, str] = {0: name}
+    starts: set[int] = {0}
     drawn: list[tuple[str, tuple]] = []
     try:
-        for name in chosen:
-            starts.add(len(candidates))
-            origin[len(candidates)] = name
-            candidates.append(Model(STARTS[name]))
-            if settings.no_search:
-                continue
+        if not settings.no_search:
             settings.llm_model = settings.llm_model or served(settings.url)
-            print(f"asking {settings.agents} agents on {settings.llm_model} for a curve family, from {name}")
-            kept, proposals = await propose(settings, Model(STARTS[name]), brief, pool)
+            print(
+                f"asking {settings.agents} agents on {settings.llm_model} for "
+                f"a {settings.target} block, from {name}"
+            )
+            kept, proposals = await propose(settings, start_model, brief, pool)
             drawn.append((name, proposals))
             for model in kept:
                 origin[len(candidates)] = name

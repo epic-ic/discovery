@@ -20,6 +20,7 @@ import os
 import sys
 import textwrap
 import types
+from inspect import getsource
 from pathlib import Path
 
 import pytest
@@ -35,30 +36,217 @@ from examples.malaria import data, initial
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", sorted(initial.STARTS))
-def test_starting_models_expose_both_rewritable_regions(name):
-    """Two regions, named, in the order the proposer is shown them."""
-    assert [b.name for b in Model(initial.STARTS[name]).blocks] == ["parameters", "curves"]
+#: every `(target, start)` the driver can be asked for
+ALL_STARTS = sorted(initial.STARTS)
 
 
-@pytest.mark.parametrize("name", sorted(initial.STARTS))
-def test_starting_models_are_syntactically_whole(name):
-    compile(initial.STARTS[name], f"<{name}>", "exec")
+@pytest.mark.parametrize("key", ALL_STARTS)
+def test_starting_models_expose_both_rewritable_regions(key):
+    """Two regions, named, in the order the proposer is shown them.
+
+    The mechanism block is named for the target, which is what makes a proposal
+    for one target unusable at the other rather than silently misplaced.
+    """
+    target, _ = key
+    assert [b.name for b in Model(initial.STARTS[key]).blocks] == ["parameters", target]
+
+
+@pytest.mark.parametrize("key", ALL_STARTS)
+def test_starting_models_are_syntactically_whole(key):
+    compile(initial.STARTS[key], f"<{key}>", "exec")
+
+
+@pytest.mark.parametrize("key", ALL_STARTS)
+def test_every_start_declares_the_two_callables_the_runner_requires(key):
+    """`runner.compile_provider` wants module-level `parameters` and `curves`.
+
+    At the `immunity` target `curves` is the template's, not the candidate's, so
+    this is the check that the template really provides it -- a start that only
+    defined `immunity` would fail an hour into a run rather than here.
+    """
+    import ast
+
+    tree = ast.parse(initial.STARTS[key])
+    defined = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+    assert {"parameters", "curves"} <= defined
+
+
+@pytest.mark.parametrize("key", ALL_STARTS)
+def test_no_start_imports_jax_directly(key):
+    """The portability gate's request, checked on the models that must obey it.
+
+    A start that reached for `jax.numpy` would be a start that fails its own
+    gate, and it would teach every proposal drawn from it to do the same. Parsed
+    rather than grepped: the templates name `jax.numpy` in prose, telling a
+    proposer not to import it.
+    """
+    import ast
+
+    imported = set()
+    for node in ast.walk(ast.parse(initial.STARTS[key])):
+        if isinstance(node, ast.Import):
+            imported |= {alias.name.split(".")[0] for alias in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert "jax" not in imported, "starts go through `dmeq.backend().xp`"
+
+
+@pytest.mark.parametrize("key", ALL_STARTS)
+def test_every_start_documents_the_whole_backend_interface(key):
+    """`backend().xp` alone is the wrong half to tell a proposer.
+
+    `xp` is the arithmetic, and the arithmetic is portable for free because the
+    names are shared. What a proposer cannot guess is the five primitives the array
+    API does not cover -- and one of them, a recursion over the age grid, is what an
+    immunity model is. A candidate told only about `xp` writes `jax.lax.scan` and
+    fails a gate, or unrolls 165 classes and passes it at the cost of a fit.
+    """
+    from dmeq._backend import Backend
+
+    source = initial.STARTS[key]
+    for field in Backend._fields:
+        assert field in source, field
+    assert "backend().scan" in source
+    assert "backend().set_at" in source
+    assert "calculate_immunity" in source
+
+
+@pytest.mark.parametrize("start", initial.START_NAMES)
+def test_the_immunity_recursion_is_readable_and_fixed(start):
+    """`getsource` extracts one function and not its callees.
+
+    Left alone that makes `calculate_immunity(...)` an opaque call at the level
+    that holds the actual mechanism -- section 9's complaint about `dmeq.solve`,
+    one level down. So the recursion and the two-line step it is built from are
+    spliced in verbatim, and *outside* the markers: a candidate may call it,
+    ignore it, or write its own, but the incumbent's cannot be edited out from
+    under the comparison.
+    """
+    from dmeq.dmeq import _next_immunity, calculate_immunity
+
+    source = initial.STARTS["immunity", start]
+    for function in (_next_immunity, calculate_immunity):
+        assert getsource(function).rstrip() in source
+
+    # outside the markers: the only rewritable regions are still the two named ones
+    bodies = "\n".join(b.body for b in Model(source).blocks)
+    assert "def calculate_immunity" not in bodies
+
+    # and not imported as well, which would shadow the definition a proposer reads
+    imported = {
+        alias.strip()
+        for line in source.splitlines()
+        if line.startswith("from dmeq import ")
+        for alias in line.removeprefix("from dmeq import ").split(",")
+    }
+    assert "calculate_immunity" not in imported
+
+
+def test_the_backend_contract_cannot_break_the_docstring_it_sits_in():
+    """The failure mode `undocumented` exists to prevent, on a synthetic case.
+
+    A nested triple quote would close the candidate's own docstring early and leave
+    a module that still parses and means something else -- the worst available
+    failure, and one no gate downstream would catch.
+    """
+    quoted = 'class Thing:\n    """A docstring.\n\n    Over several lines.\n    """\n    a: int\n'
+    assert initial.undocumented(quoted) == "class Thing:\n    a: int"
+    with pytest.raises(ValueError, match="triple quotes survived"):
+        initial.undocumented('class Thing:\n    a: int  # """ in a comment\n')
 
 
 def test_a_proposal_rewriting_both_regions_splices_into_a_whole_model():
     """The thing `birthdates` never exercised: two blocks from one reply."""
-    proposed = Model(initial.SCRATCH).substitute(
+    proposed = Model(initial.STARTS["curves", "scratch"]).substitute(
         {
             "parameters": "return {'a': sample('a', dist.Beta(2.0, 2.0))}",
-            "curves": "prev_m = params['a'] * jnp.ones_like(ages)\ninc = jnp.ones_like(ages)",
+            "curves": (
+                "def mechanism(params, log_eir, ft, ages, prop, mu):\n"
+                "    xp = backend().xp\n"
+                "    return params['a'] * xp.ones_like(ages), xp.ones_like(ages)"
+            ),
         }
     )
     compile(proposed.source, "<proposed>", "exec")
     assert "params['a']" in proposed.source
     # the scaffolding either side of the blocks survived
-    assert "def curves(params, log_eir, ft, ages, prop, mu):" in proposed.source
+    assert "prev_m, inc = mechanism(params, log_eir, ft, ages, prop, mu)" in proposed.source
     assert [b.name for b in proposed.blocks] == ["parameters", "curves"]
+
+
+def test_the_immunity_incumbent_is_dmeqs_own_source():
+    """Item 9's whole point: a generated incumbent cannot drift from the model fitted.
+
+    Not "agrees with" -- *is*. If this ever fails it is because someone
+    reformatted the extraction, and the fix is the extraction, not a new pin.
+    """
+    from inspect import getsource
+
+    from dmeq import griffin_immunity
+
+    source = initial.STARTS["immunity", "griffin"]
+    assert getsource(griffin_immunity).rstrip("\n") in source
+    # and the alias that lets the fixed driver reach it
+    assert "immunity = griffin_immunity" in source
+
+
+def test_both_griffin_targets_sample_the_same_parameter_block():
+    """The claim the two targets' numbers are compared on.
+
+    Every name the incumbent samples is read by the immunity model and none by
+    the equilibrium state solve, so the parameter block is written down once and
+    reused. If it were copied, this is what would catch the copy drifting.
+    """
+    blocks = {
+        target: {b.name: b.body for b in Model(initial.STARTS[target, "griffin"]).blocks}
+        for target in initial.TARGETS
+    }
+    assert blocks["curves"]["parameters"] == blocks["immunity"]["parameters"]
+    # and the immunity block is the same text too: at `curves` it is simply
+    # followed by the state solve and the driver, inside the same region
+    assert blocks["immunity"]["immunity"] in blocks["curves"]["curves"]
+
+
+def test_the_target_is_an_aperture_over_one_model():
+    """The property that makes the two targets' scores comparable.
+
+    `--target` does not choose between two models. It chooses how much of one model
+    the markers open up: at `immunity` the state solve and the driver are fixed text
+    below the block, at `curves` the very same text is inside it. So the incumbent
+    at the two targets must define exactly the same things, and differ only in which
+    of them a proposal is allowed to touch.
+    """
+    import ast
+
+    def defined(source):
+        return {
+            node.name
+            for node in ast.parse(source).body
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+        }
+
+    curves, immunity = (initial.STARTS[t, "griffin"] for t in ("curves", "immunity"))
+    assert defined(curves) == defined(immunity)
+
+    inside = {
+        target: "\n".join(b.body for b in Model(initial.STARTS[target, "griffin"]).blocks)
+        for target in initial.TARGETS
+    }
+    # the state solve and the driver: searchable at one target, fixed at the other
+    for name in ("def _non_het_prev(", "def mechanism("):
+        assert name in inside["curves"], name
+        assert name not in inside["immunity"], name
+
+
+def test_a_start_that_names_no_mechanism_for_its_target_is_refused():
+    """The assembly's own error, rather than a candidate that compiles to nothing."""
+    from examples.malaria.starts import curves_scratch, griffin
+
+    with pytest.raises(ValueError, match="immunity"):
+        initial.assemble("immunity", curves_scratch)
+    # and `griffin` carries no mechanism at all, by design: it must be given one
+    with pytest.raises(ValueError, match="curves"):
+        initial.assemble("curves", griffin)
 
 
 def test_split_labels_match_the_ones_msinf_writes():
@@ -210,23 +398,37 @@ def config(tables, f64):
     )
 
 
-def provider_from(source):
-    """Compile a candidate's source the way `runner.compile_provider` does."""
-    from examples.malaria.runner import compile_provider
+def compiled(source):
+    """`(provider, namespace)`, the way `runner.fit` compiles a candidate.
+
+    The namespace as well as the pair, because the portability gate stands in
+    front of a mechanism block the fixed scaffolding calls rather than calling it
+    itself -- see `gates.WATCHED`.
+    """
+    from examples.malaria.runner import compile_candidate, require_provider
     from msinf.curves import CurveProvider
 
-    return CurveProvider(*compile_provider(source))
+    namespace = compile_candidate(source)
+    return CurveProvider(*require_provider(namespace)), namespace
+
+
+def provider_from(source):
+    """Just the provider, for the tests that have no use for the namespace."""
+    return compiled(source)[0]
 
 
 @needs_msinf
-def test_the_incumbent_candidate_agrees_with_msinfs_own_model(config):
-    """`TODO_discovery.md` item 4: the skeleton is duplicated, so pin it.
+@pytest.mark.parametrize("target", initial.TARGETS)
+def test_the_incumbent_candidate_agrees_with_msinfs_own_model(config, target):
+    """`TODO_discovery.md` item 4, as item 9 leaves it.
 
-    `initial.GRIFFIN` restates the Griffin provider as source a proposer can
-    read and correct. `msinf.curves.griffin_provider` is the same model as the
-    inference package fits it. They will drift, and a silent drift means the
-    search is optimising a model that is not the one msinf reports on -- so fix
-    a seed and a parameter vector and assert the two log-densities agree.
+    At the `immunity` target the mechanism is `dmeq`'s own source and cannot
+    drift, so half of what this used to assert is now true by construction. It is
+    still worth running, and at both targets: what it pins is no longer only the
+    mechanism but the hand-written parameter block, the template's unit
+    convention, and -- at `immunity` -- that splicing a function into
+    `solve(immunity=...)` reproduces the model msinf fits rather than merely
+    something plausible.
     """
     import jax
     from msinf.model import build_model_kwargs, hierarchical_model, model_kwargs_for_sampler
@@ -236,7 +438,7 @@ def test_the_incumbent_candidate_agrees_with_msinfs_own_model(config):
     reference, _, _ = build_model_kwargs(config)  # provider=None -> the incumbent
     candidate, _, _ = build_model_kwargs(
         config.__class__(**{**config.__dict__, "init_strategy": "median"}),
-        provider=provider_from(initial.GRIFFIN),
+        provider=provider_from(initial.STARTS[target, "griffin"]),
     )
 
     # One parameter vector, drawn once from the reference model's own prior and
@@ -259,7 +461,8 @@ def test_the_incumbent_candidate_agrees_with_msinfs_own_model(config):
 
 
 @needs_msinf
-def test_the_incumbent_candidate_declares_the_same_parameters(config):
+@pytest.mark.parametrize("target", initial.TARGETS)
+def test_the_incumbent_candidate_declares_the_same_parameters(config, target):
     """Same names, same priors -- otherwise the densities above agree by luck."""
     import jax
     from msinf.config import resolve_priors
@@ -281,7 +484,7 @@ def test_the_incumbent_candidate_declares_the_same_parameters(config):
             if site["type"] == "sample"
         }
 
-    assert sites(provider_from(initial.GRIFFIN).parameters) == sites(
+    assert sites(provider_from(initial.STARTS[target, "griffin"]).parameters) == sites(
         griffin_provider(resolve_priors("xi")).parameters
     )
 
@@ -301,27 +504,41 @@ def gate(source, scaffolding):
     from examples.malaria import gates
 
     ages, prop, mu = scaffolding
-    provider = provider_from(source)
-    return gates.check(provider.parameters, provider.curves, ages=ages, prop=prop, mu=mu, draws=4)
+    provider, namespace = compiled(source)
+    return gates.check(
+        provider.parameters, provider.curves,
+        ages=ages, prop=prop, mu=mu, draws=4, namespace=namespace,
+    )
 
 
 @needs_msinf
-def test_both_starting_models_pass_the_gates(scaffolding):
-    """A start that could not be fitted would make the whole run meaningless."""
-    for name, source in initial.STARTS.items():
-        assert gate(source, scaffolding) == (), name
+@pytest.mark.parametrize("key", ALL_STARTS)
+def test_every_starting_model_passes_the_gates(key, scaffolding):
+    """A start that could not be fitted would make the whole run meaningless.
+
+    At the `immunity` target this is also the smoke test that replaces half of
+    section 4's pin: the generated module imports, splices, runs and produces
+    curves a fit can be spent on.
+    """
+    assert gate(initial.STARTS[key], scaffolding) == (), key
 
 
 BROKEN = {
-    "prevalence out of range": "prev_m = 3.0 * jnp.ones_like(ages)\ninc = 0.1 * jnp.ones_like(ages)",
-    "incidence absurd": "prev_m = 0.3 * jnp.ones_like(ages)\ninc = 500.0 * jnp.ones_like(ages)",
-    "not finite": "prev_m = jnp.full_like(ages, jnp.nan)\ninc = 0.1 * jnp.ones_like(ages)",
-    "no response to EIR": "prev_m = 0.3 * jnp.ones_like(ages)\ninc = 0.1 * jnp.ones_like(ages)",
+    "prevalence out of range": "return 3.0 * xp.ones_like(ages), 0.1 * xp.ones_like(ages)",
+    "incidence absurd": "return 0.3 * xp.ones_like(ages), 500.0 * xp.ones_like(ages)",
+    "not finite": "return xp.full_like(ages, xp.nan), 0.1 * xp.ones_like(ages)",
+    "no response to EIR": "return 0.3 * xp.ones_like(ages), 0.1 * xp.ones_like(ages)",
     "inverted in EIR": (
-        "prev_m = 0.9 * jnp.exp(-jnp.exp(log_eir)) * jnp.ones_like(ages)\n"
-        "inc = 0.1 * jnp.ones_like(ages)"
+        "return 0.9 * xp.exp(-xp.exp(log_eir)) * xp.ones_like(ages), 0.1 * xp.ones_like(ages)"
     ),
 }
+
+#: the fixed shell a `BROKEN` body is dropped into: only the last line varies, so
+#: each fault is one statement rather than a transcribed function.
+MECHANISM = """\
+def mechanism(params, log_eir, ft, ages, prop, mu):
+    xp = backend().xp
+    {body}"""
 
 
 @needs_msinf
@@ -332,10 +549,69 @@ def test_the_gates_catch_a_candidate_that_runs_but_is_nonsense(fault, scaffoldin
     None of these raises, hangs or errors: each returns arrays of the right
     shape and would consume a full fit before anybody noticed.
     """
-    source = Model(initial.SCRATCH).substitute(
-        {"curves": textwrap.dedent(BROKEN[fault])}
+    source = Model(initial.STARTS["curves", "scratch"]).substitute(
+        {"curves": MECHANISM.format(body=BROKEN[fault])}
     ).source
     assert gate(source, scaffolding), fault
+
+
+#: candidates that are numerically fine and not portable, one per target. Both
+#: import jax directly, which is the only way to fail this gate without also
+#: failing one of the four above.
+UNPORTABLE = {
+    "curves": (
+        "curves",
+        """\
+        def mechanism(params, log_eir, ft, ages, prop, mu):
+            import jax.numpy as jnp
+            eir = jnp.exp(log_eir)
+            saturation = eir / (eir + 20.0)
+            return (0.8 * saturation * jnp.ones_like(ages),
+                    0.2 * saturation * jnp.ones_like(ages))""",
+    ),
+    "immunity": (
+        "immunity",
+        """\
+        def immunity(eps, grid, re, p):
+            import jax.numpy as jnp
+            ones = jnp.ones_like(eps)
+            b = p['b0'] * ones
+            return Immunity(foi=b * eps, phi=p['phi0'] * ones, q=p['d1'] * ones, b=b)""",
+    ),
+}
+
+
+@needs_msinf
+@pytest.mark.parametrize("target", sorted(UNPORTABLE))
+def test_the_gates_catch_a_candidate_that_only_runs_on_jax(target, scaffolding):
+    """Portability as a checked property rather than a line in the brief.
+
+    This candidate is finite, in range and rises with EIR, so every other gate
+    passes it. It would fit, score, and then fail the first time anything wanted
+    its curves without a jax backend -- which is the failure the error message has
+    to name, so assert on the message too.
+    """
+    block, body = UNPORTABLE[target]
+    source = Model(initial.STARTS[target, "scratch"]).substitute(
+        {block: textwrap.dedent(body)}
+    ).source
+    reasons = gate(source, scaffolding)
+    assert len(reasons) == 1, reasons
+    assert "backend" in reasons[0]
+
+
+@needs_msinf
+def test_the_portability_gate_passes_the_starts_it_should(scaffolding):
+    """The gate on its own, so a failure above says which gate failed."""
+    from examples.malaria import gates
+
+    ages, prop, mu = scaffolding
+    for key in ALL_STARTS:
+        provider, namespace = compiled(initial.STARTS[key])
+        assert gates.portable(
+            provider.parameters, provider.curves,
+            ages=ages, prop=prop, mu=mu, namespace=namespace,
+        ) == (), key
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +688,7 @@ def test_the_bench_hides_every_row_the_fold_holds_out(bench_env, bench_tables):
     dropped = held_out_studies(whole, Split(kind="study", n_studies=3, seed=42))
     assert len(dropped) == 3
 
-    df, _, _ = bench_env.build()
+    df, *_ = bench_env.build()
     assert not df["study_index"].isin(dropped).any()
     # and nothing else was lost: what is left is exactly the complement. The
     # whole age range included -- hiding the held-out studies is the only thing
@@ -426,7 +702,7 @@ def test_the_bench_hides_every_row_the_fold_holds_out(bench_env, bench_tables):
 def test_the_bench_namespace_is_what_the_description_promises(bench_env):
     """Every name the proposer is told about, and the columns it is told to read."""
     space = bench_env.namespace()
-    assert set(space) == {"df", "ages", "prop", "np", "pd"}
+    assert set(space) == {"df", "ages", "prop", "grid", "re", "eps", "np", "pd"}
     promised = {
         "stream", "rate", "numer", "denom", "age0", "age1", "age_mid", "age_bracket",
         "eir", "eir_category", "ft", "ft_alpha", "ft_beta", "site_i", "study_index",
@@ -436,6 +712,10 @@ def test_the_bench_namespace_is_what_the_description_promises(bench_env):
     assert set(space["df"]["stream"]) <= {"incidence", "prevalence"}
     assert space["prop"].shape[1] == space["ages"].size
     assert space["prop"].sum(axis=1) == pytest.approx(1.0)
+    # what an `immunity` block is handed, on the same site indexing as `prop`
+    assert space["re"].shape == space["eps"].shape == space["prop"].shape
+    assert space["grid"].years.size == space["ages"].size
+    assert space["grid"].years == pytest.approx(space["ages"])
 
 
 @needs_msinf
@@ -444,9 +724,41 @@ def test_snippets_cannot_reach_each_other_through_the_frame(bench_env):
     first = bench_env.namespace()
     first["df"]["rate"] = -1.0
     first["prop"][:] = 0.0
+    first["eps"][:] = 0.0
+    # a NamedTuple's fields are not replaceable, but the arrays inside are writable
+    first["grid"].years[:] = 0.0
     second = bench_env.namespace()
     assert (second["df"]["rate"] != -1.0).any()
     assert second["prop"].sum(axis=1) == pytest.approx(1.0)
+    assert second["eps"].max() > 0.0
+    assert second["grid"].years.max() > 0.0
+
+
+@needs_msinf
+def test_the_immunity_inputs_are_indexed_and_scaled_the_way_the_fit_scales_them(bench_env):
+    """Two ways `re` and `eps` could be built wrong and still look plausible.
+
+    Both are `(n_site, n_age)` like `prop`, so a transposed or wrongly broadcast
+    build would be indexable and meaningless. The terminal age class is absorbing
+    -- nobody ages out of it -- so its `re` is mortality alone, which pins the age
+    axis; and `eps` is linear in the site's annual EIR, which pins the site axis.
+    """
+    import numpy as np
+
+    space = bench_env.namespace()
+    df, re, eps = space["df"], space["re"], space["eps"]
+
+    # the age axis: ageing out of the absorbing class is zero, so `re` there is
+    # the death rate, and strictly below what the finest infant classes see
+    assert (re[:, -1] < re[:, 0]).all()
+    assert re[:, -1] == pytest.approx(re[:, -1].min())
+
+    # the site axis: two sites' eps are in the ratio of their prior EIRs
+    by_site = df.groupby("site_i")["eir"].first()
+    low, high = by_site.idxmin(), by_site.idxmax()
+    assert eps[high] / eps[low] == pytest.approx(by_site[high] / by_site[low])
+    # and the age profile is the relative biting rate: children are bitten less
+    assert np.all(np.diff(eps[high]) >= 0.0)
 
 
 @needs_msinf
@@ -464,7 +776,7 @@ def test_prop_is_one_row_per_site_whatever_the_mortality(bench_env, bench_tables
     whole, _ = encode_canonical_sites(pd.read_csv(table))
     n_site = int(whole["site_i"].max()) + 1
 
-    df, ages, prop = bench_env.build()
+    df, ages, prop, *_ = bench_env.build()
     assert prop.shape == (n_site, ages.size)
     assert n_site > df["site_i"].nunique()  # the study split dropped sites
     assert df["site_i"].max() < n_site
@@ -509,7 +821,7 @@ def test_a_wpp_mortality_table_is_resolved_the_way_the_fit_resolves_it(
     pd.DataFrame(rows).to_csv(mortality, index=False)
     monkeypatch.setenv("MALARIA_MORTALITY", str(mortality))
 
-    df, bench_ages, prop = bench_env.build()
+    df, bench_ages, prop, *_ = bench_env.build()
     n_site = int(frame["site_i"].max()) + 1
     _, theirs = resolve_demography(
         df=frame, mortality_csv=mortality, n_site=n_site, ages=ages

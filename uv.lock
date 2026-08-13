@@ -361,10 +361,11 @@ wheels = [
 [[package]]
 name = "dmeq"
 version = "0.3.0"
-source = { git = "https://github.com/giovannic/dmeq.git?rev=feat%2Fsearchable#9a9655f4ccf89107729f0883f40b522a4470a613" }
+source = { git = "https://github.com/giovannic/dmeq.git?rev=feat%2Fsearchable#99591aabc4ab5bd71e14b5dc28b7e9375ba6948a" }
 dependencies = [
     { name = "jax" },
     { name = "jaxlib" },
+    { name = "numpy" },
 ]
 
 [[package]]

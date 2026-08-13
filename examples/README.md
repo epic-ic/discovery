@@ -139,7 +139,7 @@ observational model fixed and does all the inference; this example owns the
 search and the harness contract.
 
 ```sh
-uv run python -m examples.malaria --url http://host:8000/v1 --agents 8 --start both
+uv run python -m examples.malaria --url http://host:8000/v1 --agents 8 --target immunity --start griffin
 ```
 
 ### One interpreter, and one thing that is not on this machine
@@ -186,30 +186,52 @@ curves in another.
 
 ```python
 # @discovery:begin parameters   sample statements, once per evaluation
-# @discovery:begin curves       pure jax, called under vmap, once per site
+# @discovery:begin curves       the whole mechanism, at --target curves
+# @discovery:begin immunity     the immunity model, at --target immunity
 ```
 
-The block writes prevalence in `[0, 1]` and incidence in episodes per
-person-**year**. Fixed scaffolding immediately below it converts to what the
-likelihood actually consumes -- a population fraction per person-**day**, since
-`msinf` averages a bin as `sum_a w(a) curve(a) / sum_a w(a) prop(a)` and scales
-incidence by 365 -- so a candidate is written in the units it can reason about.
+The block returns prevalence in `[0, 1]` and incidence in episodes per
+person-**year**. A fixed `curves` below it converts to what the likelihood
+actually consumes -- a population fraction per person-**day**, since `msinf`
+averages a bin as `sum_a w(a) curve(a) / sum_a w(a) prop(a)` and scales incidence
+by 365 -- so a candidate is written in the units it can reason about.
+
+### Two targets, one model
+
+`--target` chooses how much of one model the markers open up, not which model:
+
+* `curves` -- the immunity model, the equilibrium state solve and the driver are
+  all inside the block. A candidate replaces the equilibrium model entirely.
+* `immunity` -- only the `eps -> (foi, phi, q, b)` block is inside. The state
+  solve and the driver sit below it as fixed text, which a candidate can read but
+  not change: what *consumes* the four values it returns should not have to be
+  guessed at.
+
+Both assembled modules define exactly the same things, so the incumbent's score is
+one number rather than two, and it is the reference either search is judged
+against.
 
 ### Two starting models
 
-`--start both` is the point of the exercise, and the two searches do not see
-each other:
+One per run -- `--start scratch` or `--start griffin`. Comparing them means two
+runs and two reports, which is the shell's job: a single run that drew from both
+would double its own length and the two rounds would still have to stay blind to
+each other, since they stop being that comparison the moment either can read the
+other's proposals.
 
-* `scratch` -- prevalence and incidence that respond to EIR and to nothing else.
-  No immunity, no age structure. The analogue of birthdates' level-and-trend.
+* `scratch` -- prevalence and incidence that respond to EIR and to nothing else,
+  or immunity that does not accumulate. The analogue of birthdates'
+  level-and-trend.
 * `griffin` -- the incumbent equilibrium model, for *correction* rather than
   discovery. It is misspecified; the question is whether a search seeded with it
   beats one started from nothing, and whether the two converge anywhere near
   each other.
 
-`griffin` restates `msinf.curves.griffin_provider` as source a proposer can
-read. That duplication is deliberate and `tests/test_malaria.py` pins it: a
-fixed seed and parameter vector, and the two log-densities have to agree.
+`griffin`'s mechanism is not restated -- it is `inspect.getsource` from `dmeq`, so
+what a proposer reads is byte for byte what the fit runs. `tests/test_malaria.py`
+still pins it against `msinf.curves.griffin_provider` at a fixed seed and
+parameter vector, at both targets, because the parameter block and the 25-line
+driver standing in for `dmeq._solve` are the two pieces that are not extracted.
 
 Expect something flexible in age × EIR with no mechanism in it to score near the
 top. That is not a failure -- it is the empirical ceiling on held-out

@@ -12,13 +12,25 @@ a spread of EIRs, and asked four questions:
 * is everything finite,
 * is prevalence a probability,
 * is incidence in a band a person could plausibly experience,
-* and does prevalence *rise* with transmission?
+* does prevalence *rise* with transmission,
+* and does the model give the same answer on both of `dmeq`'s array backends?
 
-The last is the one that catches a candidate which is merely arbitrary rather
+The fourth is the one that catches a candidate which is merely arbitrary rather
 than merely wrong: any story about malaria in which more infectious bites do not
 mean more infection is not a story about malaria. It is checked on the average
 over prior draws rather than draw by draw, because a flexible family will invert
 the relationship somewhere in its prior without that being what the model says.
+
+The fifth is a portability check, and it turns a request into a property. A
+candidate is asked to write array operations through `dmeq.backend().xp` rather
+than `import jax.numpy as jnp` -- it is the same set of names, and it is what
+`dmeq`'s own source does, which is what the `immunity` target's proposer reads.
+The reason to insist is that the model then runs without jax: an analysis worker
+that wants to look at a curve, a portability probe like this one, or anything
+downstream that reuses `dmeq` on numpy. A request in the brief would be followed
+sometimes; a gate with an actionable error is followed always. It is affordable
+because a numpy solve on the Griffin grid costs about 8ms -- see
+`dmeq/tests/test_backend.py` for the agreement the comparison relies on.
 
 A failure is a reason, not an exception: the caller reports it and moves on, and
 the models worth looking at are often the ones that failed.
@@ -108,6 +120,177 @@ def probe(parameters, curves, *, ages, prop, mu, ft=FT, eirs=EIRS, draws=DRAWS, 
     return np.asarray(jnp.stack(prev)), np.asarray(jnp.stack(inc))
 
 
+#: how far the two backends' curves may differ, relative to the jax result.
+#: `dmeq`'s own backend test pins its solve at ~1e-15; this is loose enough to
+#: allow a different summation order and tight enough that a genuinely different
+#: computation fails.
+BACKEND_RTOL = 1e-9
+
+
+def draw_plain(parameters, seed=0):
+    """One prior draw of the candidate's parameters, as plain numpy leaves.
+
+    `parameters()` is numpyro and therefore jax, always -- sampling is not the
+    portable half of a model. Converting the draw is what lets `curves` be run
+    afterwards on a backend that has never seen a jax array.
+    """
+    import jax
+
+    params = handlers.seed(parameters, rng_seed=jax.random.PRNGKey(seed))()
+    return jax.tree.map(lambda leaf: np.asarray(leaf, dtype=np.float64), params)
+
+
+#: candidate blocks the fixed scaffolding calls, rather than this module calling
+#: them. At the `immunity` target `curves` belongs to the template and reaches the
+#: candidate's block through `dmeq.solve`, so the only way to see what the
+#: candidate wrote is to look it up in the module globals and stand in front of it.
+WATCHED = ("immunity",)
+
+#: the advice every portability finding ends with. One string because a proposer
+#: acts on the instruction, not on the diagnosis.
+ADVICE = (
+    "Replace `import jax.numpy as jnp` with `from dmeq import backend` and "
+    "`xp = backend().xp`: the function names are the same and the model then runs "
+    "on either backend"
+)
+
+
+def all_numpy(value) -> bool:
+    """Whether a returned value, or every field of one, is a numpy array.
+
+    A `NamedTuple` of arrays and a bare array are both things a block may return,
+    and something that is neither is a shape problem for another gate to report.
+    """
+    if isinstance(value, np.ndarray):
+        return True
+    try:
+        fields = tuple(value)
+    except TypeError:
+        return False
+    return bool(fields) and all(isinstance(field, np.ndarray) for field in fields)
+
+
+def portable(
+    parameters,
+    curves,
+    *,
+    ages,
+    prop,
+    mu,
+    ft=FT,
+    eirs=EIRS,
+    seed=0,
+    rtol=BACKEND_RTOL,
+    namespace=None,
+):
+    """Reasons the model is not backend-portable. Empty means it is.
+
+    One prior draw and every probed EIR: portability is a property of the code
+    rather than of the draw, so a second draw re-asks the same question. No `vmap`
+    either -- the numpy backend's is a Python loop, and what is being checked is
+    the arithmetic, not the mapping.
+
+    Two findings, not one, because agreement alone does not settle it: `jax.numpy`
+    accepts numpy input and returns a jax array, so a candidate that imported
+    `jnp` directly agrees with itself to the last bit while never having left jax.
+    Nor is the returned type enough on its own -- dmeq's numpy `set_at` assigns
+    into a numpy array and silently casts a jax value on the way in, so a leak
+    inside an `immunity` block never reaches `curves`' output. Hence `WATCHED`:
+    the block is replaced by a wrapper that records what it returned, in the pass
+    where the answer has to be numpy.
+    """
+    import jax
+    from dmeq import backend, use_backend
+
+    plain = draw_plain(parameters, seed=seed)
+    fixed = tuple(np.asarray(a, dtype=np.float64) for a in (ages, prop, mu))
+    log_eir = np.log(np.asarray(eirs, dtype=np.float64))
+
+    def under(name):
+        """One backend's answers, on that backend's own array types.
+
+        Converting the inputs and not only reading the outputs, because a mixed
+        configuration is one that never occurs: the fit hands jax arrays to the jax
+        backend and the bench hands numpy arrays to the numpy one. Handing numpy
+        arrays to jax would fail on any model that indexes `prop` by a traced index
+        -- which the equilibrium state recursion does, once per age class -- and
+        that failure would be the probe's, not the candidate's.
+        """
+        with use_backend(name):
+            xp = backend().xp
+            params = jax.tree.map(xp.asarray, plain)
+            arrays = tuple(xp.asarray(a) for a in fixed)
+            return [curves(params, xp.asarray(le), ft, *arrays) for le in log_eir]
+
+    seen: dict[str, list[bool]] = {}
+    restore = {}
+    for name in WATCHED:
+        block = (namespace or {}).get(name)
+        if not callable(block):
+            continue
+        seen[name], restore[name] = [], block
+
+        def watcher(*args, _block=block, _seen=seen[name], **kwargs):
+            out = _block(*args, **kwargs)
+            _seen.append(all_numpy(out))
+            return out
+
+        namespace[name] = watcher
+
+    running = "jax"
+    try:
+        on_jax = under("jax")
+        # The jax pass is entitled to return jax arrays, so only the numpy pass'
+        # records are evidence of anything.
+        for records in seen.values():
+            records.clear()
+        running = "numpy"
+        on_numpy = under("numpy")
+    except Exception as error:  # noqa: BLE001 -- any failure here is the finding
+        # Which backend raised, and not a guess at it: a failure under jax is a
+        # different diagnosis from a failure under numpy, and the advice below only
+        # fits the second.
+        raised = f"{type(error).__name__}: {error}"
+        return (f"the model raised when run on dmeq's {running} backend: {raised}. {ADVICE}",)
+    finally:
+        if restore:
+            namespace.update(restore)
+
+    for name, records in seen.items():
+        if records and not all(records):
+            finding = (
+                f"`{name}` returned a jax array from a run on dmeq's numpy backend, so "
+                f"it does not use the backend it is given. {ADVICE}"
+            )
+            return (finding,)
+
+    leaked = [
+        kind
+        for pair in on_numpy
+        for kind, value in zip(("prevalence", "incidence"), pair)
+        if not all_numpy(value)
+    ]
+    if leaked:
+        finding = (
+            f"`curves` returned {min(leaked)} as a jax array from a run on dmeq's numpy "
+            f"backend, so it does not use the backend it is given. {ADVICE}"
+        )
+        return (finding,)
+
+    for kind, index in (("prevalence", 0), ("incidence", 1)):
+        for eir, left, right in zip(eirs, on_jax, on_numpy):
+            a, b = np.asarray(left[index], dtype=np.float64), np.asarray(right[index])
+            if not np.allclose(a, b, rtol=rtol, atol=0.0, equal_nan=True):
+                worst = float(np.nanmax(np.abs(a - b) / np.maximum(np.abs(a), 1e-300)))
+                finding = (
+                    f"{kind} differs between dmeq's jax and numpy backends at EIR "
+                    f"{eir:g}: worst relative difference {worst:.3g}, where {rtol:g} is "
+                    f"allowed. The two must be the same computation"
+                )
+                return (finding,)
+    return ()
+
+
 def check(
     parameters,
     curves,
@@ -122,6 +305,8 @@ def check(
     inc_max=INC_MAX,
     response=RESPONSE,
     window=WINDOW,
+    rtol=BACKEND_RTOL,
+    namespace=None,
 ) -> tuple[str, ...]:
     """Every reason this candidate should not be fitted. Empty means fit it.
 
@@ -191,5 +376,15 @@ def check(
             f"{by_eir[0]:.3g} at EIR {eirs[0]:g} against {by_eir[-1]:.3g} at EIR {eirs[-1]:g}, "
             f"a gain of {gain:+.3g} where at least {response:g} is required"
         )
+
+    # Last, and separately: it costs a handful of solves on a slow backend, and a
+    # candidate whose numbers are nonsense above has a more useful finding waiting
+    # for it than a note about which array library it imported.
+    reasons.extend(
+        portable(
+            parameters, curves, ages=ages, prop=prop, mu=mu, ft=ft, eirs=eirs,
+            seed=seed, rtol=rtol, namespace=namespace,
+        )
+    )
 
     return tuple(reasons)
