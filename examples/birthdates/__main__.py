@@ -141,6 +141,8 @@ async def propose(settings: argparse.Namespace, start: Model, brief: str) -> tup
     print(f"{len(kept)}/{len(proposals)} proposals parsed")
     if failed := failures(proposals, settings.out):
         print(f"failed agents: {failed}")
+    if talk := transcripts(proposals, settings.out):
+        print(f"transcripts: {talk}")
     return kept
 
 
@@ -169,6 +171,44 @@ def failures(proposals, out: Path) -> Path | None:
         return None
     out.mkdir(parents=True, exist_ok=True)
     path = out / "failures.jsonl"
+    with open(path, "w") as handle:
+        for record in records:
+            json.dump(record, handle, default=str)
+            handle.write("\n")
+    return path
+
+
+def transcripts(proposals, out: Path) -> Path | None:
+    """Write down every conversation the round had, successes included.
+
+    `failures.jsonl` keeps the exchange behind an agent that wrote nothing, and
+    the report keeps the model an agent that succeeded wrote -- but not the
+    snippets it ran to get there. For a tool-using agent that is most of what
+    happened, and it is the only account of why a candidate looks the way it
+    does, so it is written down rather than dropped when the round returns.
+
+    `candidate` is the index the kept proposal takes in the fit, since the run
+    fits the starting model first and the proposals after it in order; that is
+    what joins a conversation to its row in the report.
+    """
+    kept = 0
+    records = []
+    for proposal in proposals:
+        if proposal.ok:
+            kept += 1
+        records.append(
+            {
+                "agent": proposal.agent,
+                "ok": proposal.ok,
+                "candidate": kept if proposal.ok else None,
+                "error": None if proposal.ok else f"{type(proposal.error).__name__}: {proposal.error}",
+                "transcript": list(proposal.transcript),
+            }
+        )
+    if not records:
+        return None
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "transcripts.jsonl"
     with open(path, "w") as handle:
         for record in records:
             json.dump(record, handle, default=str)

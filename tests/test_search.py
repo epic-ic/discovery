@@ -181,6 +181,28 @@ async def test_one_unreadable_sample_does_not_sink_the_batch(model):
     assert failed.reply == "I have no suggestions."  # inspectable, not just counted
 
 
+async def test_every_sample_carries_the_conversation_behind_it(model):
+    """The batch shares a prompt, so a sample's conversation is that prompt and
+    its own answer -- which is the whole record of why it wrote what it did."""
+    s = search(agents=3)
+    proposals = await s.propose(model)
+    (call,) = s.client.calls
+    for proposal in proposals:
+        *prompt, answer = proposal.transcript
+        assert prompt == call["messages"]
+        assert answer["role"] == "assistant"
+        assert f"StudentT({proposal.agent}.0" in answer["content"]
+
+
+async def test_an_unreadable_sample_still_carries_its_conversation(model):
+    """A failed sample is exactly the one worth reading back."""
+    s = search(agents=1, handler=lambda agent, kwargs: "I have no suggestions.")
+    (proposal,) = await s.propose(model)
+    assert not proposal.ok
+    assert [m["role"] for m in proposal.transcript] == ["system", "user", "assistant"]
+    assert proposal.transcript[-1]["content"] == "I have no suggestions."
+
+
 async def test_a_sample_truncated_before_it_spoke_says_so(model):
     """The failure that dominates in practice: the model thinks past its budget
     and returns nothing, which is a decode setting to fix."""
@@ -258,6 +280,37 @@ class FakeAnalysis:
         return "ok"
 
 
+@dataclass
+class ToolClient(FakeClient):
+    """A client whose agent looks at the data once before it answers.
+
+    Shaped like the real one where the proposer touches it: a call carries an
+    id and a `function` with a name and json arguments.
+    """
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        await asyncio.sleep(0)
+        if not any(m["role"] == "tool" for m in kwargs["messages"]):
+            call = type(
+                "ToolCall",
+                (),
+                {
+                    "id": "call-1",
+                    "function": type(
+                        "Function",
+                        (),
+                        {"name": "run_python", "arguments": '{"code": "print(values.mean())"}'},
+                    )(),
+                },
+            )()
+            message = type("Message", (), {"content": "", "tool_calls": [call]})()
+        else:
+            message = type("Message", (), {"content": reply("Laplace(0.0, 1.0)")})()
+        choice = type("Choice", (), {"message": message, "finish_reason": self.finish_reason})()
+        return type("Completion", (), {"choices": [choice]})()
+
+
 def agents(**kwargs) -> AgentSearch:
     kwargs.setdefault("agents", 4)
     client = kwargs.pop("client", None) or FakeClient(
@@ -324,6 +377,39 @@ async def test_agents_continue_their_conversations_across_rounds(model):
     await s.propose(models(first)[0], feedback="round two")
     roles = [m["role"] for m in s.proposers[0].transcript]
     assert roles == ["system", "user", "assistant", "user", "assistant"]
+
+
+async def test_an_agent_hands_back_the_conversation_it_had(model):
+    """The proposers are the search's, and a caller that wants to write the
+    round down should not have to reach into them for it."""
+    s = agents(agents=2)
+    proposals = await s.propose(model)
+    for proposal, proposer in zip(proposals, s.proposers, strict=True):
+        assert list(proposal.transcript) == proposer.transcript
+        assert [m["role"] for m in proposal.transcript] == ["system", "user", "assistant"]
+
+
+async def test_an_agent_that_used_a_tool_hands_back_what_it_ran(model):
+    """The snippets are most of what a tool-using agent did, and they are only
+    ever kept in the conversation."""
+    analysis = FakeAnalysis()
+    s = agents(agents=1, analysis=analysis, client=ToolClient())
+    (proposal,) = await s.propose(model)
+    assert proposal.ok
+    roles = [m["role"] for m in proposal.transcript]
+    assert roles == ["system", "user", "assistant", "tool", "assistant"]
+    assert proposal.transcript[2]["tool_calls"][0]["function"]["name"] == "run_python"
+    assert "ok" in proposal.transcript[3]["content"]
+
+
+async def test_a_failed_agent_hands_back_what_it_had(model):
+    """Not the turns it just lost -- those travel on the error -- but the
+    conversation it will start its next round from."""
+    s = agents(agents=1, handler=lambda agent, kwargs: "nothing useful here")
+    (proposal,) = await s.propose(model)
+    assert not proposal.ok
+    assert [m["role"] for m in proposal.transcript] == ["system"]
+    assert [m["role"] for m in proposal.error.exchange] == ["user"]
 
 
 async def test_reset_starts_the_conversations_again(model):

@@ -352,7 +352,7 @@ wheels = [
 [[package]]
 name = "dmeq"
 version = "0.3.0"
-source = { git = "https://github.com/giovannic/dmeq.git?rev=feat%2Fsearchable#99591aabc4ab5bd71e14b5dc28b7e9375ba6948a" }
+source = { git = "https://github.com/giovannic/dmeq.git?rev=99591aabc4ab5bd71e14b5dc28b7e9375ba6948a#99591aabc4ab5bd71e14b5dc28b7e9375ba6948a" }
 dependencies = [
     { name = "jax" },
     { name = "jaxlib" },
@@ -811,7 +811,7 @@ dependencies = [
 requires-dist = [
     { name = "arviz", specifier = ">=0.18" },
     { name = "distrax", specifier = ">=0.1.5" },
-    { name = "dmeq", git = "https://github.com/giovannic/dmeq.git?rev=feat%2Fsearchable" },
+    { name = "dmeq", git = "https://github.com/giovannic/dmeq.git?rev=99591aabc4ab5bd71e14b5dc28b7e9375ba6948a" },
     { name = "hydra-core", specifier = ">=1.3" },
     { name = "jax", specifier = ">=0.4.30" },
     { name = "jaxlib", specifier = ">=0.4.30" },

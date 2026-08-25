@@ -89,6 +89,13 @@ class Proposal:
     agent: int
     model: Model | None = None
     error: Exception | None = None
+    #: every turn behind this proposal, system prompt first, as it was sent. A
+    #: model is the answer and the exchange is the working: what the agent
+    #: measured, what came back, and what it wrote off the back of it. The
+    #: report keeps only the answer, so a caller that wants the working has to
+    #: be handed it here -- once the batch returns, an agent's conversation is
+    #: either continued or dropped, and nothing else has a reference to it.
+    transcript: tuple[dict[str, Any], ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -152,14 +159,17 @@ class IIDSearch:
 
         proposals: list[Proposal] = []
         for agent, choice in enumerate(response.choices):
+            reply = choice.message.content or ""
+            # Two turns and a reply: the samples share a prompt and differ only
+            # in what came back, so each one's whole conversation is the common
+            # prefix with its own answer on the end.
+            transcript = (*messages, {"role": "assistant", "content": reply})
             try:
-                proposed = splice(
-                    model, choice.message.content or "", getattr(choice, "finish_reason", None)
-                )
+                proposed = splice(model, reply, getattr(choice, "finish_reason", None))
             except Exception as error:
-                proposals.append(Proposal(agent=agent, error=error))
+                proposals.append(Proposal(agent=agent, error=error, transcript=transcript))
             else:
-                proposals.append(Proposal(agent=agent, model=proposed))
+                proposals.append(Proposal(agent=agent, model=proposed, transcript=transcript))
         return tuple(proposals)
 
     async def aclose(self) -> None:
@@ -248,11 +258,15 @@ class AgentSearch:
 
         async def one(agent: int, proposer: ModelProposer) -> Proposal:
             try:
-                return Proposal(agent=agent, model=await proposer.propose(model, feedback, **settings))
+                proposed = await proposer.propose(model, feedback, **settings)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                return Proposal(agent=agent, error=error)
+                # The conversation as it stands, which for a failure is what
+                # the agent had before this round: the turns it just lost are
+                # never committed, and travel on the error instead.
+                return Proposal(agent=agent, error=error, transcript=tuple(proposer.transcript))
+            return Proposal(agent=agent, model=proposed, transcript=tuple(proposer.transcript))
 
         return tuple(await asyncio.gather(*(one(a, p) for a, p in enumerate(self.proposers))))
 

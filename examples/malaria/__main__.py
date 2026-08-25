@@ -30,6 +30,16 @@ At `--target curves`, expect something flexible in age x EIR with no mechanism i
 it to be near the top: that is not a failure, it is the empirical ceiling on
 held-out likelihood.
 
+The two halves of a run can be separated. `--propose-only` draws the round and
+writes every candidate to `<out>/proposals` as source, stopping before anything
+is fitted; `--proposals <dir>` fits a round written that way and never opens a
+connection. The server is then needed only for the minutes the proposals take,
+not the hours the fits do, and the same round can be refitted later -- under a
+longer budget, or after the evaluation changes -- without redrawing it. A drawn
+round also leaves `<out>/transcripts.jsonl`: every agent's conversation, the
+snippets it ran included, which is the only account of why a candidate looks the
+way it does once the proposals are just source files.
+
 `--no-search` skips the language model and fits only the starting models, which
 is the fastest way to see the whole evaluation path work -- though "fastest" here
 is a fit per split per model, at tens of minutes each.
@@ -109,6 +119,19 @@ def options(argv: list[str] | None = None) -> argparse.Namespace:
     )
     llm.add_argument("--search-timeout", type=float, default=1800.0)
     llm.add_argument("--no-search", action="store_true", help="fit only the starting models")
+    llm.add_argument(
+        "--propose-only",
+        action="store_true",
+        help="draw the round, write the candidates to <out>/proposals, and stop before "
+        "any fitting -- so the inference server is only needed for the cheap half",
+    )
+    llm.add_argument(
+        "--proposals",
+        type=Path,
+        default=None,
+        help="fit a round written earlier by --propose-only, instead of drawing one; "
+        "needs no server, and --target/--start are read from the saved round",
+    )
 
     tools = parser.add_argument_group("data analysis at proposal time")
     tools.add_argument(
@@ -155,6 +178,15 @@ def options(argv: list[str] | None = None) -> argparse.Namespace:
     fit.add_argument("--chains", type=int, default=4)
     fit.add_argument("--seed", type=int, default=0)
     fit.add_argument("--max-parameters", type=int, default=200)
+    fit.add_argument(
+        "--inc-max",
+        type=float,
+        default=20.0,
+        help="clinical episodes per person-year no age class may exceed on a prior "
+        "draw. `inf` fits whatever the prior permits -- negative incidence still "
+        "fails -- which is how to ask what a candidate the gate rejected would have "
+        "scored, at the price of the fit it was there to save",
+    )
     fit.add_argument("--concurrency", type=int, default=1,
                      help="fits in flight at once; each is chains x one thread and a lot of memory")
     fit.add_argument("--fit-timeout", type=float, default=None,
@@ -249,6 +281,104 @@ def failures(proposals, out: Path) -> Path | None:
             json.dump(record, handle, default=str)
             handle.write("\n")
     return path
+
+
+def transcripts(proposals, placed: dict[tuple[str, int], int], out: Path) -> Path | None:
+    """Write down every conversation the round had, successes included.
+
+    `failures.jsonl` keeps the exchange behind an agent that never produced a
+    model, and the proposals directory keeps the model an agent that did
+    produced -- but not how it got there. For a tool-using agent that is most of
+    what happened: the snippets it ran against the data, what came back, and the
+    reasoning it wrote off the back of them. It is the only record of why a
+    candidate looks the way it does, and it is gone as soon as the round
+    returns, so it is written beside the round rather than reconstructed later.
+
+    One record per agent, naming the model it proposed against and, when the
+    proposal was kept, the candidate index it became -- which is what joins a
+    conversation to its row in the report and its file in `proposals/`.
+    """
+    records = [
+        {
+            "start": parent,
+            "agent": p.agent,
+            "ok": p.ok,
+            "candidate": placed.get((parent, p.agent)),
+            "error": None if p.ok else f"{type(p.error).__name__}: {p.error}",
+            "transcript": list(p.transcript),
+        }
+        for parent, batch in proposals
+        for p in batch
+    ]
+    if not records:
+        return None
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "transcripts.jsonl"
+    with open(path, "w") as handle:
+        for record in records:
+            json.dump(record, handle, default=str)
+            handle.write("\n")
+    return path
+
+
+def save(candidates: list[Model], origin: dict[int, str], settings, out: Path) -> Path:
+    """Write a drawn round to disk as source files, one per candidate.
+
+    The half of a run that needs the language model is minutes of it; the half
+    that needs a machine is hours. Writing the round down between them means the
+    server has to be up only for the first, and that the same round can be
+    refitted later -- under a longer budget, or after the evaluation changes --
+    without paying for new proposals or wondering whether they are the same ones.
+
+    Source files rather than one json blob because a candidate *is* a source
+    file: it can be read, diffed and edited where it lands, and the index and
+    parent a fit needs are in the name. `0000` is the model the round started
+    from, exactly as it was proposed against.
+    """
+    directory = out / "proposals"
+    directory.mkdir(parents=True, exist_ok=True)
+    for old in directory.glob("*.py"):
+        old.unlink()
+    for index, model in enumerate(candidates):
+        (directory / f"{index:04d}-{origin[index]}.py").write_text(model.source)
+    (directory / "round.json").write_text(
+        json.dumps(
+            {
+                "target": settings.target,
+                "start": settings.start,
+                "llm_model": settings.llm_model,
+                "agents": settings.agents,
+                "analysis": settings.analysis,
+                "tool_budget": settings.tool_budget,
+                "temperature": settings.temperature,
+                "top_p": settings.top_p,
+                "top_k": settings.top_k,
+                "max_tokens": settings.max_tokens,
+                "thinking_token_budget": settings.thinking_token_budget,
+                "candidates": len(candidates),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return directory
+
+
+def load(directory: Path) -> tuple[list[Model], dict[int, str], dict]:
+    """Read back a round written by `save`: the candidates and their parents.
+
+    The starting model comes back from the file too rather than from `STARTS`,
+    so a round fitted later is fitted against the same parent it was drawn
+    against even if the starting models have since been edited.
+    """
+    paths = sorted(directory.glob("*.py"))
+    if not paths:
+        raise SystemExit(f"no candidates in {directory}")
+    candidates = [Model(path.read_text()) for path in paths]
+    origin = {index: path.stem.split("-", 1)[-1] for index, path in enumerate(paths)}
+    meta_path = directory / "round.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    return candidates, origin, meta
 
 
 #: the split the table's `vs best` column pairs on, taken from `RANK` so the
@@ -350,8 +480,14 @@ def table(evaluations, origin: dict[int, str], starts: set[int], splits: tuple[s
 
 async def main(argv: list[str] | None = None) -> int:
     settings = options(argv)
-    if not settings.no_search and not settings.url:
-        raise SystemExit("--url (or $DISCOVERY_URL) is required unless --no-search")
+    #: whether this run talks to the inference server at all. A round is either
+    #: drawn now, read back from one drawn earlier, or skipped entirely.
+    searching = not settings.no_search and settings.proposals is None
+    if settings.propose_only and not searching:
+        raise SystemExit("--propose-only draws a round, so it cannot be used with "
+                         "--no-search or --proposals")
+    if searching and not settings.url:
+        raise SystemExit("--url (or $DISCOVERY_URL) is required unless --no-search or --proposals")
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
     splits = tuple(s.strip() for s in settings.splits.split(",") if s.strip())
@@ -362,7 +498,8 @@ async def main(argv: list[str] | None = None) -> int:
     # nothing to run, and it is worth saying so once, up front.
     inputs = data.inputs(settings.table, settings.eir_priors, settings.mortality)
     summary = data.read(inputs.table)
-    print(f"target  {settings.target}")
+    if settings.proposals is None:
+        print(f"target  {settings.target}")
     print(f"table   {summary}")
     for kind in splits:
         print(f"split   {data.label(kind, settings.holdout_seed, settings.n_studies)}")
@@ -385,7 +522,7 @@ async def main(argv: list[str] | None = None) -> int:
     # and the same fold the fit will use, and hides what that fold holds out --
     # see `analysis.py`.
     pool = None
-    if settings.analysis and not settings.no_search:
+    if settings.analysis and searching:
         pool = Analysis(
             setup=setup.__name__,
             description=setup.DESCRIPTION,
@@ -404,32 +541,66 @@ async def main(argv: list[str] | None = None) -> int:
         print(f"        {settings.analysis_workers} analysis workers, {settings.tool_budget} calls each")
 
     name = settings.start
-    start_model = Model(STARTS[settings.target, name])
     #: every candidate's parent, so a row says which search it came from. The
     #: starting model is its own parent, and is the row marked `*`.
-    candidates: list[Model] = [start_model]
-    origin: dict[int, str] = {0: name}
+    candidates: list[Model] = []
+    origin: dict[int, str] = {}
     starts: set[int] = {0}
     drawn: list[tuple[str, tuple]] = []
-    try:
-        if not settings.no_search:
-            settings.llm_model = settings.llm_model or served(settings.url)
-            print(
-                f"asking {settings.agents} agents on {settings.llm_model} for "
-                f"a {settings.target} block, from {name}"
+    #: which candidate each kept proposal became, by the agent that wrote it
+    placed: dict[tuple[str, int], int] = {}
+    if settings.proposals is not None:
+        candidates, origin, meta = load(settings.proposals)
+        name = origin.get(0, name)
+        drawn_at = meta.get("llm_model", "an unrecorded model")
+        print(
+            f"fitting {len(candidates)} candidates read from {settings.proposals}, "
+            f"a {meta.get('target', '?')} round from {name} drawn on {drawn_at}"
+        )
+    else:
+        candidates = [Model(STARTS[settings.target, name])]
+        origin = {0: name}
+        try:
+            if searching:
+                settings.llm_model = settings.llm_model or served(settings.url)
+                print(
+                    f"asking {settings.agents} agents on {settings.llm_model} for "
+                    f"a {settings.target} block, from {name}"
+                )
+                _kept, proposals = await propose(settings, candidates[0], brief, pool)
+                drawn.append((name, proposals))
+                for proposal in proposals:
+                    if proposal.model is None:
+                        continue
+                    # Walked per proposal rather than over `kept` so the agent
+                    # that wrote each candidate is kept alongside it; the order
+                    # is the same either way.
+                    placed[name, proposal.agent] = len(candidates)
+                    origin[len(candidates)] = name
+                    candidates.append(proposal.model)
+        finally:
+            # Before the fits rather than after them: the workers hold the table
+            # and a few hundred megabytes each, and the fits want every core.
+            if pool is not None:
+                await pool.aclose()
+        if failed := failures(drawn, settings.out):
+            print(f"failed agents: {failed}")
+        if kept_talk := transcripts(drawn, placed, settings.out):
+            print(f"transcripts: {kept_talk}")
+
+    if settings.propose_only:
+        # A round of nothing but the model it started from is a failed round, and
+        # writing it as a directory the fit half will happily consume is how a
+        # server that was down for ten seconds becomes a report that says the
+        # incumbent won. Refuse it here, where the reason is still on screen.
+        if len(candidates) == 1:
+            raise SystemExit(
+                f"no proposals parsed: nothing to write. See {settings.out}/failures.jsonl"
             )
-            kept, proposals = await propose(settings, start_model, brief, pool)
-            drawn.append((name, proposals))
-            for model in kept:
-                origin[len(candidates)] = name
-                candidates.append(model)
-    finally:
-        # Before the fits rather than after them: the workers hold the table and
-        # a few hundred megabytes each, and the fits want every core.
-        if pool is not None:
-            await pool.aclose()
-    if failed := failures(drawn, settings.out):
-        print(f"failed agents: {failed}")
+        written = save(candidates, origin, settings, settings.out)
+        print(f"proposals: {written}")
+        print(f"fit them with --proposals {written} (no server needed)")
+        return 0
 
     budget = Budget(
         table=str(inputs.table),
@@ -443,6 +614,7 @@ async def main(argv: list[str] | None = None) -> int:
         chains=settings.chains,
         seed=settings.seed,
         max_parameters=settings.max_parameters,
+        inc_max=settings.inc_max,
     )
     print(
         f"fitting {len(candidates)} candidates x {len(splits)} splits, "
