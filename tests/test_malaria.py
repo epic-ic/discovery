@@ -342,6 +342,34 @@ needs_msinf = pytest.mark.skipif(
 )
 
 
+@needs_msinf
+def test_the_msinf_entry_points_the_runner_uses_are_importable():
+    """`import msinf` is not the claim the example rests on; these are.
+
+    `needs_msinf` asks `find_spec`, which locates the package without executing
+    a single submodule -- so a dependency of msinf's that has moved an API out
+    from under it still looks importable here and fails in the child process
+    instead, an hour into a sweep and with the traceback in a per-candidate
+    error string. These are the two modules `examples/malaria/runner.py`
+    imports, imported for real. `psis_smooth` and `tail_ess` are named because
+    they are the call sites that reach arviz, which is where the skew was: msinf
+    and discovery must agree on one arviz-stats, and the version they agree on
+    must be one whose API they both call.
+    """
+    import numpy as np
+    from msinf.evaluate import _tail_ess, evaluate  # noqa: F401 -- the import is the test
+    from msinf.fit import psis_smooth
+
+    rng = np.random.default_rng(0)
+    # Weights with an actual tail: the smoother fits a Pareto to it, and a
+    # constant vector has none to fit.
+    smoothed, khat = psis_smooth(rng.normal(size=256))
+    assert smoothed.shape == (256,)
+    assert np.isfinite(khat)
+
+    assert _tail_ess({"x": rng.normal(size=(4, 200))}) > 0.0
+
+
 @pytest.fixture(scope="module")
 def f64():
     from msinf.dtypes import set_precision

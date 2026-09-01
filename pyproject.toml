@@ -34,7 +34,9 @@ examples = [
     { include-group = "analysis" },
     "numpyro>=0.21",
     "jax>=0.7",
-    "arviz-stats>=1.2",
+    # Same distribution and same bounds as msinf declares, so the two are one
+    # constraint for the resolver rather than two that can drift apart.
+    "arviz-stats>=1.3,<2",
     "matplotlib>=3.10",
 ]
 #: the malaria example only. `msinf` is not on PyPI, so it comes from a sibling
