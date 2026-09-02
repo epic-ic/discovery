@@ -202,6 +202,14 @@ write into `proposal.py`, spliced back into the file.
 `msinf` is not here: the likelihood, the split and the score are not yours to
 run, and this sandbox cannot fit anything. There is no network.
 
+## Isolation rule
+
+Your entire working world for this task is the current directory. Do not inspect
+or access any path outside it, including `/tmp`, `/home`, sibling sandboxes,
+previous runs, repository history, or other proposals. Do not search for or read
+files outside the current directory. The only proposal you may use is the one
+you derive from the files supplied here.
+
 ## Your budget
 
 You have @@MINUTES@@ minutes of wall clock, and nothing warns you as it runs
@@ -431,6 +439,14 @@ def command(settings: argparse.Namespace, path: Path) -> list[str]:
     reads `ANTHROPIC_API_KEY` only, `--safe-mode` leaves the normal login alone.
     Prefer `--bare`.
     """
+    if settings.cli == "codex":
+        return [settings.cli, "exec", "--model", settings.model, "--cd", str(path),
+            # The outer experiment environment provides process containment;
+            # keep Codex unrestricted so it can execute the copied venv. The
+            # no-cross-sandbox rule is explicit in ROLE.md and audited below.
+            "--sandbox", "danger-full-access",
+                "--skip-git-repo-check", "--ephemeral", "--ignore-user-config",
+                "--ignore-rules", "--json"]
     argv = [
         settings.cli,
         "-p",
@@ -460,6 +476,8 @@ def environment(settings: argparse.Namespace, path: Path) -> dict[str, str]:
     by the flag instead.
     """
     env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE_", "MALARIA_", "DISCOVERY_"))}
+    if settings.cli == "codex":
+        return {k: v for k, v in env.items() if k not in {"OPENAI_API_KEY", "CODEX_API_KEY"}}
     env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
     if settings.auth == "api-key":
         config = path.parent / f"cfg-{path.name}"
@@ -573,6 +591,18 @@ def conversation(log: Path) -> tuple[list[dict], dict]:
         except json.JSONDecodeError:
             continue
         kind = event.get("type")
+        if kind == "item.completed":
+            item = event.get("item") or {}
+            if item.get("type") == "agent_message":
+                turns.append({"role": "assistant", "content": item.get("text", "")})
+            elif item.get("type") in {"command_execution", "file_change"}:
+                turns.append({"role": "assistant", "content": json.dumps(item, default=str)})
+            continue
+        if kind == "turn.completed":
+            usage = event.get("usage") or {}
+            if event.get("model"):
+                usage["model"] = event["model"]
+            continue
         if kind in {"assistant", "user"}:
             message = event.get("message", {})
             resolved = message.get("model") or resolved
@@ -608,6 +638,19 @@ def conversation(log: Path) -> tuple[list[dict], dict]:
     if resolved:
         usage["model"] = resolved
     return turns, usage
+
+
+def outside_workspace(turns: list[dict], path: Path) -> list[str]:
+    """Return transcript lines that name paths outside this agent's sandbox."""
+    root = str(path.resolve())
+    suspicious: list[str] = []
+    for turn in turns:
+        content = str(turn.get("content", ""))
+        for line in content.splitlines():
+            if "/tmp/" in line or "/home/" in line:
+                if root not in line:
+                    suspicious.append(line[:1000])
+    return suspicious
 
 
 class ProposalError(ValueError):
@@ -675,6 +718,9 @@ def collect(settings: argparse.Namespace, paths: list[Path], out: Path, sessions
         session_record = by_agent.get(agent, {})
         log = Path(session_record.get("log", out / "sessions" / f"a{agent:02d}.jsonl"))
         turns, usage = conversation(log)
+        outside = outside_workspace(turns, path)
+        if outside:
+            usage["outside_workspace"] = outside
         resolved = usage.get("model") or resolved
         error: str | None = None
         note: dict = {}
@@ -710,6 +756,7 @@ def collect(settings: argparse.Namespace, paths: list[Path], out: Path, sessions
                 "tampered": note.get("tampered"),
                 "blocks": note.get("blocks"),
                 "transcript": turns,
+                "outside_workspace": outside or None,
             }
         )
         usages.append(
@@ -737,7 +784,7 @@ def collect(settings: argparse.Namespace, paths: list[Path], out: Path, sessions
                 # alias moves and a round has to say what drew it.
                 "llm_model": resolved or settings.model,
                 "requested_model": settings.model,
-                "harness": "claude-code",
+                "harness": "codex-cli" if settings.cli == "codex" else "claude-code",
                 # `message.model` comes back as the alias itself -- a first-party
                 # session reports `claude-opus-5`, not a dated id -- so what
                 # actually pins this round is the alias, the CLI version and the
@@ -745,7 +792,7 @@ def collect(settings: argparse.Namespace, paths: list[Path], out: Path, sessions
                 "drawn_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "cli_version": version(settings.cli),
                 "tools": TOOLS,
-                "auth": settings.auth,
+                "auth": "subscription" if settings.cli == "codex" else settings.auth,
                 "agents": settings.agents,
                 "analysis": True,
                 "tool_budget": None,

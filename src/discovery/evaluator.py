@@ -44,7 +44,7 @@ class Artifact:
     media_type: str = "image/png"
 
     #: subtypes whose obvious extension is not the subtype itself
-    SUFFIXES = {"jpeg": ".jpg", "svg+xml": ".svg"}
+    SUFFIXES = {"jpeg": ".jpg", "svg+xml": ".svg", "npz": ".npz"}
 
     @property
     def suffix(self) -> str:

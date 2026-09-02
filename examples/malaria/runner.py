@@ -26,6 +26,7 @@ a fit, and because their numbers are reported separately and never averaged.
 """
 
 import base64
+import io
 import json
 import os
 import sys
@@ -190,6 +191,7 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
     import jax.numpy as jnp
     from msinf.age_grid import GRIFFIN_AGE_GRID
     from msinf.config import NumpyroConfig
+    from msinf.compare import BY_CHAIN_KEY
     from msinf.curves import CurveProvider
     from msinf.dtypes import asfloat
     from msinf.evaluate import evaluate
@@ -216,7 +218,7 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
         # initialise by name and no reference draws to fix anything against.
         init_strategy="median",
         prior_family=config["prior_family"],
-        collect_warmup=False,
+        collect_warmup=True,
         progress_bar=False,
         seed=config["seed"],
     )
@@ -296,6 +298,22 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
             f"{kind}.{name.removesuffix('.png')}": base64.b64encode(payload).decode()
             for name, payload in result.figures.items()
         }
+
+        # Match msinf's run_inference artifact format: posterior arrays are
+        # grouped by chain and warmup arrays are named warmup__<site>. This is
+        # written from the FitResult already used for scoring, so archiving it
+        # never triggers a second fit.
+        fit_result = result.fit_result
+        if fit_result is not None:
+            samples = fit_result.draws_by_chain or fit_result.draws
+            payload = io.BytesIO()
+            np.savez(
+                payload,
+                **{name: np.asarray(value) for name, value in samples.items()},
+                **fit_result.extra.get("warmup_samples", {}),
+                **{BY_CHAIN_KEY: np.asarray(fit_result.draws_by_chain is not None)},
+            )
+            artifacts[f"{kind}.samples.npz"] = base64.b64encode(payload.getvalue()).decode()
 
         # Identifiability against the prior, from the draws this fit already
         # produced. A second fit to answer it would be a diagnostic of a

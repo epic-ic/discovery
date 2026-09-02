@@ -175,6 +175,8 @@ class Posterior(Diagnostics):
             for name, value in report["metrics"].items()
         }
         return metrics | {
-            name: Artifact(name, base64.b64decode(payload))
+            name: Artifact(name, base64.b64decode(payload), "application/npz")
+            if name.endswith(".samples.npz")
+            else Artifact(name, base64.b64decode(payload))
             for name, payload in report["artifacts"].items()
         }
