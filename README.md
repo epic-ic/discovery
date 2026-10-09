@@ -2,6 +2,8 @@
 
 A package for model discovery. It orchestrates agents for a model search.
 
+NOTE: this is 100% agent written and the code unreviewed (however diagnostics and proposals have been sanity checked). Use at your own risk.
+
 # Installation
 
 ```sh
