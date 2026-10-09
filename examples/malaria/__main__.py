@@ -386,15 +386,15 @@ def load(directory: Path) -> tuple[list[Model], dict[int, str], dict]:
 RANKED_SPLIT = RANK.split(".")[1]
 
 
-def pointwise(evaluation, kind: str) -> tuple[float, ...] | None:
-    """One candidate's per-unit held-out elpd under `kind`, cells then rows.
+def pointwise(scores, kind: str, fold: str = "holdout") -> tuple[float, ...] | None:
+    """One candidate's per-unit elpd on `fold` under `kind`, cells then rows.
 
     `None` if it was not scored -- a gated or failed candidate has no vector,
     and neither does a report written before `pointwise_*` existed.
     """
     parts = []
     for stream in ("incidence", "prevalence"):
-        vector = evaluation.scores.get(f"posterior.{kind}.pointwise_holdout_{stream}")
+        vector = scores.get(f"posterior.{kind}.pointwise_{fold}_{stream}")
         if vector is None:
             return None
         parts.extend(float(x) for x in vector)
@@ -410,15 +410,15 @@ def leads(order, kind: str) -> dict[int, str]:
     the top few are indistinguishable. Empty for the reference row itself, and
     for anything that cannot be paired with it.
     """
-    scored = [e for e in order if e.ok and pointwise(e, kind) is not None]
+    scored = [e for e in order if e.ok and pointwise(e.scores, kind) is not None]
     if not scored:
         return {}
     best, *rest = scored
-    reference = pointwise(best, kind)
+    reference = pointwise(best.scores, kind)
     out = {best.index: "ref"}
     for evaluation in rest:
         try:
-            difference, se = elpd_diff(pointwise(evaluation, kind), reference)
+            difference, se = elpd_diff(pointwise(evaluation.scores, kind), reference)
         except ValueError:
             # Different fold, so not comparable. It should not happen in one
             # run -- every candidate is fitted under the same split -- and if it
