@@ -298,6 +298,13 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
             f"{kind}.{name.removesuffix('.png')}": base64.b64encode(payload).decode()
             for name, payload in result.figures.items()
         }
+        # Every observed row beside its posterior predictive, per fold, from this
+        # candidate's own curves. `feedback.py` hands the training one to the
+        # next round's agents; the held-out one is for whoever reads the report.
+        artifacts |= {
+            f"{kind}.fitted_{fold}.csv": base64.b64encode(frame.to_csv(index=False).encode()).decode()
+            for fold, frame in result.fitted.items()
+        }
 
         # Match msinf's run_inference artifact format: posterior arrays are
         # grouped by chain and warmup arrays are named warmup__<site>. This is

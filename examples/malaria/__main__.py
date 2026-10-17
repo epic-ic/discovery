@@ -55,7 +55,9 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -88,7 +90,11 @@ RANK = "posterior.study.elpd_holdout"
 #: Load-bearing: it sizes `--fit-timeout` and it is what the proposer is told,
 #: so a candidate that is much more expensive to solve gets killed rather than
 #: silently taking the run's whole afternoon.
-FIT_MINUTES = 20.0
+#:
+#: Measured, not guessed: Griffin at 150 + 150 x 4 chains took 136 minutes of
+#: MCMC on a 20-core laptop that was doing other work (runs/beat/r00). A
+#: dedicated cluster core is faster, which only makes the timeout generous.
+FIT_MINUTES = 140.0
 
 #: how much longer than `FIT_MINUTES x splits` a candidate may take before it is
 #: killed. Compilation, the ODE-bound scoring pass and a curve family slower than
@@ -156,7 +162,7 @@ def options(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument(
         "--start",
         choices=START_NAMES,
-        default="scratch",
+        default="griffin",
         help="scratch: deliberately poor -- no immunity and no age structure at "
         "the curves target, immunity that does not accumulate at the immunity "
         "one. griffin: the incumbent, for correction rather than discovery. "
@@ -167,15 +173,19 @@ def options(argv: list[str] | None = None) -> argparse.Namespace:
     fit = parser.add_argument_group("fit, identical for every candidate")
     fit.add_argument("--table", default=str(data.DEFAULT_TABLE), help="the <=20y study table")
     fit.add_argument("--eir-priors", default=str(data.DEFAULT_EIR_PRIORS))
-    fit.add_argument("--mortality", default=data.DEFAULT_MORTALITY,
-                     help="per-site WPP death rates; omitted keeps dmeq's uniform rate")
-    fit.add_argument("--splits", default=",".join(data.SPLITS),
-                     help="comma separated; one fit each, reported separately")
+    fit.add_argument(
+        "--mortality",
+        default=data.DEFAULT_MORTALITY,
+        help="per-site WPP death rates; omitted keeps dmeq's uniform rate",
+    )
+    fit.add_argument(
+        "--splits", default=",".join(data.SPLITS), help="comma separated; one fit each, reported separately"
+    )
     fit.add_argument("--holdout-seed", type=int, default=42, help="the study-split fold")
     fit.add_argument("--n-studies", type=int, default=3, help="studies held out by the study split")
-    fit.add_argument("--warmup", type=int, default=400)
-    fit.add_argument("--samples", type=int, default=400, help="post-warmup draws per chain")
-    fit.add_argument("--chains", type=int, default=4)
+    fit.add_argument("--warmup", type=int, default=Budget.warmup, help="warmup draws per chain")
+    fit.add_argument("--samples", type=int, default=Budget.samples, help="post-warmup draws per chain")
+    fit.add_argument("--chains", type=int, default=Budget.chains)
     fit.add_argument("--seed", type=int, default=0)
     fit.add_argument("--max-parameters", type=int, default=200)
     fit.add_argument(
@@ -187,10 +197,18 @@ def options(argv: list[str] | None = None) -> argparse.Namespace:
         "fails -- which is how to ask what a candidate the gate rejected would have "
         "scored, at the price of the fit it was there to save",
     )
-    fit.add_argument("--concurrency", type=int, default=1,
-                     help="fits in flight at once; each is chains x one thread and a lot of memory")
-    fit.add_argument("--fit-timeout", type=float, default=None,
-                     help=f"seconds; defaults to {FIT_MINUTES:.0f}min x splits x {HEADROOM:g}")
+    fit.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="fits in flight at once; each is chains x one thread and a lot of memory",
+    )
+    fit.add_argument(
+        "--fit-timeout",
+        type=float,
+        default=None,
+        help=f"seconds; defaults to {FIT_MINUTES:.0f}min x splits x {HEADROOM:g}",
+    )
 
     parser.add_argument("--out", type=Path, default=Path("runs/malaria"))
     return parser.parse_args(argv)
@@ -455,7 +473,7 @@ def table(evaluations, origin: dict[int, str], starts: set[int], splits: tuple[s
     order = sorted(evaluations, key=lambda e: (not e.ok, -e.scores.get(RANK, float("-inf"))))
     against_best = leads(order, RANKED_SPLIT)
 
-    lines = ["  #  " + " ".join(f"{name:>{len(fmt.format(0)) }}" for name, _, fmt in columns)]
+    lines = ["  #  " + " ".join(f"{name:>{len(fmt.format(0))}}" for name, _, fmt in columns)]
     for evaluation in order:
         label = f"{evaluation.index:>3}" + ("*" if evaluation.index in starts else " ")
         parent = origin.get(evaluation.index, "?")
@@ -478,14 +496,44 @@ def table(evaluations, origin: dict[int, str], starts: set[int], splits: tuple[s
     return "\n".join(lines)
 
 
+def fitted(settings: argparse.Namespace, splits: tuple[str, ...], budget: Budget) -> Path:
+    """Write down how the round beside it was fitted, as `fit.json`.
+
+    The report says what each candidate scored and not under what, and two rounds
+    are comparable only under the same split and budget. `feedback` reads the
+    split before it shows an agent anything -- another fold's training rows are
+    this fold's held-out ones -- and `rounds` groups its table by both.
+    """
+    path = settings.out / "fit.json"
+    path.write_text(
+        json.dumps(
+            {
+                "split": data.label(splits[0], settings.holdout_seed, settings.n_studies),
+                "splits": list(splits),
+                "holdout_seed": settings.holdout_seed,
+                "n_studies": settings.n_studies,
+                "warmup": budget.warmup,
+                "samples": budget.samples,
+                "chains": budget.chains,
+                "seed": budget.seed,
+                "inc_max": budget.inc_max,
+                "host": socket.gethostname(),
+                "fitted_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return path
+
+
 async def main(argv: list[str] | None = None) -> int:
     settings = options(argv)
     #: whether this run talks to the inference server at all. A round is either
     #: drawn now, read back from one drawn earlier, or skipped entirely.
     searching = not settings.no_search and settings.proposals is None
     if settings.propose_only and not searching:
-        raise SystemExit("--propose-only draws a round, so it cannot be used with "
-                         "--no-search or --proposals")
+        raise SystemExit("--propose-only draws a round, so it cannot be used with --no-search or --proposals")
     if searching and not settings.url:
         raise SystemExit("--url (or $DISCOVERY_URL) is required unless --no-search or --proposals")
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -594,9 +642,7 @@ async def main(argv: list[str] | None = None) -> int:
         # server that was down for ten seconds becomes a report that says the
         # incumbent won. Refuse it here, where the reason is still on screen.
         if len(candidates) == 1:
-            raise SystemExit(
-                f"no proposals parsed: nothing to write. See {settings.out}/failures.jsonl"
-            )
+            raise SystemExit(f"no proposals parsed: nothing to write. See {settings.out}/failures.jsonl")
         written = save(candidates, origin, settings, settings.out)
         print(f"proposals: {written}")
         print(f"fit them with --proposals {written} (no server needed)")
@@ -628,6 +674,7 @@ async def main(argv: list[str] | None = None) -> int:
     )
 
     report = write(evaluations, settings.out / "report.jsonl")
+    fitted(settings, splits, budget)
     print(f"\n{table(evaluations, origin, starts, splits)}\n\n* the models the search started from")
     print(f"report: {report}")
     return 0

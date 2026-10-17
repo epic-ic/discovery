@@ -159,11 +159,12 @@ one. The subprocess boundary is still there, for the reason it always was: model
 source written by a language model does not run in the process holding the
 results.
 
-The `<=20y` study table and the site EIR priors are **not in this repository and
-not on this machine**. Point the example at them:
+The `<=20y` study table and the site EIR priors are **not in this repository**.
+They are read from the same sibling checkout, `../msinf/artifacts/inputs/`
+(`study_data_2014.csv` is already truncated to 20y), or from wherever these say:
 
 ```sh
-export MALARIA_TABLE=/path/to/study_data_2014_age_le20.csv
+export MALARIA_TABLE=/path/to/study_data_2014.csv
 export MALARIA_EIR_PRIORS=/path/to/eir_site_priors_griffin2014.csv
 ```
 
@@ -304,11 +305,19 @@ worth looking at are often the ones that failed.
 
 ### The fit
 
-**One fit per split per candidate**, at roughly 20 minutes each: 4 chains, 400
-warmup, 400 draws, f64. f64 is not optional -- a novel curve family at f32
-through two sequential scan recursions produces NaNs, and the scoring pass
-re-runs those recursions once per retained draw. `--fit-timeout` defaults to
-20min × splits × 3.
+**One fit per split per candidate**: 4 chains, 150 warmup, 150 draws, f64 -- the
+screen -- and 400 + 400 to confirm a candidate worth believing (`fit.Budget` is
+the one place either is set). Griffin's screen took 136 minutes of MCMC on a
+20-core laptop; a cluster node is faster. f64 is not optional -- a novel curve
+family at f32 through two sequential scan recursions produces NaNs, and the
+scoring pass re-runs those recursions once per retained draw. `--fit-timeout`
+defaults to `FIT_MINUTES` (140) × splits × 3.
+
+At 150 + 150 Griffin itself does not converge: its r-hat is 3.6, all of it one
+site, Mali Doneguebougou, whose chains split between an annual EIR near 330 and
+one near 50 -- its curves fit that site about as well at either. A small lead
+between two screened fits is partly which mode their chains landed in, which is
+one more reason a win is only a win at 400 + 400.
 
 Every number comes from `msinf.evaluate`, the same entry point msinf's own
 `+experiment=holdout_*` runs go through. If a candidate's `elpd_holdout` were
@@ -321,6 +330,8 @@ not be measuring what the report claims.
 | `<split>.elpd_holdout_se` | that total's standard error over its units, so a total is not read as if it were exact. |
 | `<split>.pointwise_holdout_*` | the per-unit vectors the totals sum, in the fold's own order — the only vector-valued metrics here. Two candidates under the same split line up elementwise, which is what lets the table's `vs best` column pair them. |
 | `<split>.coverage90_holdout_*` | how often the held-out count fell inside the 90% predictive interval. |
+| `<split>.elpd_loo_train`, `pointwise_loo_*`, `loo_khat_over_0p7` | PSIS-LOO on the training units, from the per-draw log-likelihoods the scoring pass already has: the training score that does not reward an extra parameter for its own sake, and the one agents are ranked on. The last counts units whose estimate is unreliable. |
+| artifacts `<split>.fitted_train`, `<split>.fitted_holdout` | every observed row beside its 5/50/95% posterior predictive (study effects redrawn, as for a new study), randomised PIT and elpd, as CSV. The training one is what `feedback.py` shows agents. |
 | `<split>.kl.<parameter>`, `kl_min`, `unidentified` | the information the data added to each of the *candidate's own* parameters, in nats, unconstrained. The scaffolding's parameters are excluded: they are identical for every candidate and counting them would flatter a model that declared nothing. |
 | `rhat_max`, `ess_tail_min`, `divergences` | the worst of the splits, not the average: a candidate that converged under one fold and not another has not converged. |
 | `mcmc_seconds`, `total_seconds`, `parameters` | what it cost, and how much of it the candidate declared. |
@@ -351,3 +362,142 @@ source included, is in `runs/malaria/report.jsonl`.
 There is no `--analysis`. What an agent wants here is not birthdates' pandas
 namespace but a simulator bench -- run the candidate, look at the emergent
 curves, check them against the gates before proposing -- and that is deferred.
+
+### Searching for a better model
+
+The search that matters now: coding agents propose, the fits come back -- from
+this machine or from the cluster -- and every new round reads what the finished
+ones found. A **round** is a directory, and the steps never have to happen on
+the same machine or at the same time:
+
+```text
+runs/beat/r01/
+  proposals/            drawn: 0000-griffin.py is the incumbent, then one file per kept proposal
+  feedback/             what this round's agents were shown, if it had --history
+  transcripts.jsonl     every agent's session, sessions/ the raw streams
+  report.jsonl          fitted: every candidate's scores, beside artifacts/ and fit.json
+```
+
+**Setup, once.** The OpenCode agents draw on GLM-flash under llama.cpp on a
+Slurm node -- four slots of 196 608 tokens each. `opencode.json` holds its url,
+limits and reasoning variants, and every agent's own config is built from it.
+
+```sh
+uv sync --group examples --group malaria
+export LLM_API_KEY=...                                    # the llama.cpp server's key
+curl -s -H "Authorization: Bearer $LLM_API_KEY" http://127.0.0.1:8001/v1/models
+curl -s -H "Authorization: Bearer $LLM_API_KEY" http://127.0.0.1:8001/props \
+    | python -c "import json,sys; d=json.load(sys.stdin); print(d['total_slots'], d['default_generation_settings']['n_ctx'])"
+# 4 196608
+```
+
+**(a) OpenCode proposals, fitted here.**
+
+```sh
+R=runs/beat/r01
+uv run python -m examples.malaria.opencode --agents 8 --concurrency 4 --out $R
+uv run python -m examples.malaria --proposals $R/proposals --out $R --concurrency 2
+uv run python -m examples.malaria.rounds runs/beat
+```
+
+`--concurrency 4` matches the server's slots; more agents queue. Each agent may
+run for four hours (`--session-timeout`, in seconds) and is told so, with no cap
+on tool calls or thinking, at the `max` reasoning variant (`--variant high` for
+less, `''` for the model's default). A local fit is four chains of one thread
+each and peaks near 4 GB, so `--concurrency` on the fit is a memory question.
+
+**(b) OpenCode proposals, fitted on the cluster.** The head node,
+`wpia-lxhn.hpc.dide.ic.ac.uk`, shares its filesystem with every compute node
+but not with this machine, so `remote.sh` copies a round up, submits it, and
+copies the report back. A node runs `cpus / 4` fits at once: 24 on 96 CPUs.
+
+```sh
+examples/malaria/slurm/remote.sh code             # once, and after changing code: copies this checkout and ../msinf up, uv syncs
+R=runs/beat/r02
+uv run python -m examples.malaria.opencode --agents 8 --out $R --history runs/beat
+examples/malaria/slurm/remote.sh submit $R        # sbatch examples/malaria/slurm/fit.sbatch, log in $R/slurm-<job>.out
+examples/malaria/slurm/remote.sh status
+examples/malaria/slurm/remote.sh fetch $R         # once the job is done
+```
+
+`MALARIA_HOST`, `MALARIA_REMOTE` (the checkout there, relative to `~`, default
+`code/discovery`) and `MALARIA_SBATCH` (extra flags, e.g. `--partition=x
+--mem=300G`) configure it; `DRY_RUN=1` prints the commands instead. On the
+cluster itself, skip `remote.sh` and run `sbatch examples/malaria/slurm/fit.sbatch $R`
+from the checkout. At about 4 GB a fit, 24 at once wants roughly 90 GB:
+check the first job's memory with `sacct -j <job> -o MaxRSS,Elapsed`, and lower
+it with `CONCURRENCY=12` if the node has less.
+
+**(c) Codex on luna.** Subscription auth, `gpt-6-luna` at high reasoning effort,
+four hours per agent:
+
+```sh
+uv run python -m examples.malaria.codex --agents 8 --concurrency 4 --out runs/beat/r03 --history runs/beat
+```
+
+`--model` and `--reasoning-effort` override both. The round is fitted exactly
+as in (a) or (b).
+
+**(d) A loop.** Draw a round while the last one is still fitting; each round's
+feedback is built from whichever rounds have come back:
+
+```sh
+for k in 04 05 06 07 08; do
+    for done in runs/beat/r*/; do examples/malaria/slurm/remote.sh fetch "${done%/}" 2>/dev/null || true; done
+    uv run python -m examples.malaria.opencode --agents 8 --out runs/beat/r$k --history runs/beat
+    examples/malaria/slurm/remote.sh submit runs/beat/r$k
+done
+```
+
+**(e) Has anything beaten Griffin?** `rounds` pairs every candidate with the
+incumbent fitted in *its own* round -- same budget, same machine -- on the
+held-out fold, the training fold and training LOO, and groups rounds fitted
+differently apart. `!` marks a difference more than two standard errors from
+zero. The screen is 150 warmup + 150 draws; a win is one that survives a refit
+at 400 + 400:
+
+```sh
+uv run python -m examples.malaria.rounds runs/beat
+uv run python -m examples.malaria.rounds runs/beat --promote 3 --to runs/beat/confirm-01
+examples/malaria/slurm/remote.sh submit runs/beat/confirm-01 --warmup 400 --samples 400
+examples/malaria/slurm/remote.sh fetch runs/beat/confirm-01
+uv run python -m examples.malaria.rounds runs/beat
+```
+
+`--promote` ranks by training LOO and never by the held-out fold, which would
+make the confirmation fold the selection fold. A second holdout seed
+(`--holdout-seed 7` on the fit) says whether a lead depends on which three
+studies were drawn -- but it is not unseen data: the agents' feedback held those
+studies as training rows. Done means a held-out lead past `!` at 400 + 400, with
+`rhat` at most 1.01, no divergences, and no more unidentified parameters than
+Griffin.
+
+#### What an agent is given
+
+Each sandbox, under `$AGENTIC_SANDBOX` (default `/tmp/mx`), holds the starting
+model, `BRIEF.md` (what it will be fitted to and scored on), the training rows
+in `data/`, a venv with numpy, pandas, jax, numpyro and dmeq, `check.py` -- the
+runner's own `gates.check`, so no fit is spent on a candidate a gate would
+refuse -- and with `--history`, `feedback/`:
+
+* `FEEDBACK.md`: a leaderboard by training PSIS-LOO paired against the
+  incumbent, where the incumbent misses the training rows, and why the failed
+  candidates failed;
+* `incumbent/` and `candidates/<rank>-*/`: each one's blocks in `proposal.py`'s
+  format, its posterior, `fitted_train.csv` -- every training row's observed
+  rate beside its 5/50/95% posterior predictive, PIT and elpd, from the
+  candidate's own curves -- and a residual summary by stream, age band and
+  study. The incumbent also gets msinf's fitted curves over age as PNGs.
+
+**What it is never given is the held-out fold** -- not its rows, not any
+candidate's held-out score, not a posterior or plot from a fit that saw it.
+The pack is built from an allowlist of training-fold numbers, rounds fitted
+under another split are skipped, and `tests/test_feedback.py` plants a sentinel
+in every held-out field and checks it never reaches the pack. The ranking is
+decided on 35 held-out units; agents tuning against them would make it mean
+nothing. That is also why msinf's own full-data Griffin posterior
+(`msinf/outputs/.../numpyro_jamie_samples.npz`) is for cross-checks only: it was
+fitted on every study, the held-out ones included.
+
+`uv run python -m examples.malaria.feedback runs/beat --out /tmp/pack` writes
+the pack on its own, to read what agents will be shown.

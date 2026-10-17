@@ -1,4 +1,8 @@
-"""Draw malaria proposals with the subscription-authenticated Codex CLI."""
+"""Draw malaria proposals with the subscription-authenticated Codex CLI.
+
+The model and its reasoning effort default in `agentic` (`gpt-6-luna`, high);
+`--model` and `--reasoning-effort` override them.
+"""
 
 import asyncio
 import sys
@@ -10,8 +14,6 @@ async def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if "--cli" not in args:
         args += ["--cli", "codex"]
-    if "--model" not in args:
-        args += ["--model", "gpt-5"]
     return await agentic.main(args)
 
 

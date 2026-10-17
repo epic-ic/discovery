@@ -55,10 +55,12 @@ class Budget:
     looks better because it was given more warmup has not been found to be
     better.
 
-    The MCMC numbers match msinf's own `+experiment=holdout_*` configuration, so
-    a candidate's `elpd_holdout` is comparable with the number msinf reports for
-    the incumbent under the same split. `identified` is the KL, in nats, below
-    which a parameter counts as not updated by the data.
+    The one place the MCMC budget is set: `__main__` fits with it, and
+    `agentic` tells the agents it, so the two cannot disagree. 300 + 300 is the
+    screening budget every candidate gets; a candidate worth believing is refitted
+    at msinf's own 400 + 400 (`--warmup 400 --samples 400`) before it is called a
+    win. `identified` is the KL, in nats, below which a parameter counts as not
+    updated by the data.
     """
 
     table: str = str(data.DEFAULT_TABLE)
@@ -68,8 +70,8 @@ class Budget:
     splits: tuple[str, ...] = data.SPLITS
     holdout_seed: int = 42
     n_studies: int = 3
-    warmup: int = 400
-    samples: int = 400
+    warmup: int = 300
+    samples: int = 300
     chains: int = 4
     max_tree_depth: int = 10
     seed: int = 0
@@ -171,12 +173,21 @@ class Posterior(Diagnostics):
         # json has no tuples, so the `pointwise_*` vectors arrive as lists and
         # are put back into the shape the harness's `Vector` names.
         metrics = {
-            name: tuple(value) if isinstance(value, list) else value
-            for name, value in report["metrics"].items()
+            name: tuple(value) if isinstance(value, list) else value for name, value in report["metrics"].items()
         }
-        return metrics | {
-            name: Artifact(name, base64.b64decode(payload), "application/npz")
-            if name.endswith(".samples.npz")
-            else Artifact(name, base64.b64decode(payload))
-            for name, payload in report["artifacts"].items()
-        }
+        return metrics | dict(artifact(name, payload) for name, payload in report["artifacts"].items())
+
+
+def artifact(name: str, payload: str) -> tuple[str, Artifact]:
+    """One of the runner's base64 payloads, typed by its name, under the key it is reported by.
+
+    A table is keyed without its `.csv`, since the report adds the extension the
+    media type implies: `study.fitted_train` lands as `0003-posterior.study.fitted_train.csv`.
+    """
+    data = base64.b64decode(payload)
+    if name.endswith(".samples.npz"):
+        return name, Artifact(name, data, "application/npz")
+    if name.endswith(".csv"):
+        name = name.removesuffix(".csv")
+        return name, Artifact(name, data, "text/csv")
+    return name, Artifact(name, data)
