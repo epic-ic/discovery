@@ -20,6 +20,12 @@ What is left here is the part msinf has no opinion about: compiling a candidate,
 refusing to fit one that fails the cheap gates, asking whether the data moved
 each of its parameters, and putting every split in one dictionary.
 
+Given `archive` -- a split's archived chains, by kind -- it fits nothing: the
+gates already passed and the chains already ran, so it scores those chains
+again (`msinf.evaluate.score`). That is how a round fitted before a change to
+the scoring is brought under it without hours of sampling, and it is still done
+here, in a child, because it still runs the candidate's source.
+
 One fit per split, and `data.SPLITS` is currently one split -- the study fold.
 The loop stays a loop because splits hold out different rows and so cannot share
 a fit, and because their numbers are reported separately and never averaged.
@@ -43,8 +49,7 @@ os.environ.setdefault("MPLBACKEND", "Agg")  # nothing here has a screen to draw 
 # has never actually been measured -- and it matters more here, where a fit is
 # tens of minutes rather than tens of seconds.
 os.environ["XLA_FLAGS"] = (
-    f"{os.environ.get('XLA_FLAGS', '')} "
-    "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
+    f"{os.environ.get('XLA_FLAGS', '')} --xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
 ).strip()
 
 import numpy as np  # noqa: E402 -- after the environment is set
@@ -62,6 +67,29 @@ CURVES = "curves"
 #: parameters of the fixed observational model, sampled by the scaffolding. A
 #: candidate does not declare them and is not scored on them.
 SCAFFOLDING = ("rW", "rP", "log_eir", "sigma_c", "sigma_p", "alpha_c", "alpha_p", "ft_study")
+
+
+def stamp_arviz() -> None:
+    """Write arviz's once-a-day warning stamp before arviz can, under a name of our own.
+
+    On its first import each day arviz writes `daily_warning.tmp` in a cache
+    shared by every fit on the machine and renames it into place. Fits started
+    together all write that one temporary file, and every rename after the first
+    finds it gone: a `FileNotFoundError` from an import, which is what failed two
+    of `runs/beat/codex-sol-r01`'s candidates without their models being run. A
+    stamp already reading today makes arviz skip the write, and a per-process
+    temporary name makes ours safe to race.
+    """
+    import datetime
+    from pathlib import Path
+
+    from platformdirs import user_cache_dir
+
+    stamp = Path(user_cache_dir("arviz", "arviz")) / "daily_warning"
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    tmp = stamp.with_name(f"{stamp.name}.{os.getpid()}.tmp")
+    tmp.write_text(datetime.date.today().isoformat())
+    os.replace(tmp, stamp)
 
 
 def read_config() -> dict[str, Any]:
@@ -129,9 +157,7 @@ def candidate_sites(parameters) -> tuple[str, ...]:
 
     trace = handlers.trace(handlers.seed(parameters, rng_seed=jax.random.PRNGKey(0))).get_trace()
     return tuple(
-        name
-        for name, site in trace.items()
-        if site["type"] == "sample" and not site.get("is_observed", False)
+        name for name, site in trace.items() if site["type"] == "sample" and not site.get("is_observed", False)
     )
 
 
@@ -175,8 +201,32 @@ def identifiability(posterior, prior, names, model, kwargs, threshold: float) ->
     }
 
 
+def archived(path: str):
+    """A `msinf.fit.FitResult` from a samples archive this runner wrote.
+
+    Enough of one to score: the draws by chain and flattened. Divergences and
+    timings are not archived, so a caller re-scoring keeps the originals.
+    """
+    from msinf.compare import BY_CHAIN_KEY
+    from msinf.fit import FitResult
+
+    loaded = np.load(path)
+    by_chain = {
+        name: np.asarray(loaded[name])
+        for name in loaded.files
+        if name != BY_CHAIN_KEY and not name.startswith("warmup__")
+    }
+    if BY_CHAIN_KEY in loaded.files and not bool(loaded[BY_CHAIN_KEY]):
+        return FitResult(backend="nuts", draws=by_chain, seconds=0.0)
+    flat = {name: value.reshape((-1,) + value.shape[2:]) for name, value in by_chain.items()}
+    return FitResult(backend="nuts", draws=flat, seconds=0.0, draws_by_chain=by_chain)
+
+
 def fit(config: dict[str, Any]) -> dict[str, Any]:
-    """Compile, gate, then fit and score under every requested split."""
+    """Compile, gate, then fit and score under every requested split.
+
+    With `archive` in the config, score those archived chains instead of fitting.
+    """
     import numpyro
     from msinf.dtypes import set_precision
 
@@ -186,6 +236,7 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
     # and the scoring pass re-runs those recursions once per draw.
     set_precision("f64")
     numpyro.set_host_device_count(config["chains"])
+    stamp_arviz()  # before `msinf.evaluate` imports arviz
 
     import jax
     import jax.numpy as jnp
@@ -194,7 +245,7 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
     from msinf.compare import BY_CHAIN_KEY
     from msinf.curves import CurveProvider
     from msinf.dtypes import asfloat
-    from msinf.evaluate import evaluate
+    from msinf.evaluate import evaluate, score
     from msinf.model import build_model_kwargs, hierarchical_model, model_kwargs_for_sampler
     from msinf.splits import Split
     from numpyro.infer import Predictive
@@ -214,9 +265,17 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
         num_samples=config["samples"],
         num_chains=config["chains"],
         max_tree_depth=config["max_tree_depth"],
-        # A candidate invents its own parameters, so there is nothing to
-        # initialise by name and no reference draws to fix anything against.
-        init_strategy="median",
+        # Every chain starts near msinf's Griffin values for each site that has
+        # one -- the scaffolding always, and whatever Griffin names a candidate
+        # kept -- jittered per chain, and at the prior median for the rest.
+        # Shared starts keep candidates comparable with each other and with
+        # msinf's own fits. The jitter is what lets chains find more than one
+        # mode: this posterior has several (the Dicko Doneguebougou EIR near 50
+        # or near 320, with the immunity parameters that go with each), NUTS
+        # does not cross between them, and chains that all start at one point
+        # all fall into one basin and report an r-hat of 1. The chains are then
+        # weighted by stacking (`combine_chains`), not counted.
+        init_strategy="griffin_jitter",
         prior_family=config["prior_family"],
         collect_warmup=True,
         progress_bar=False,
@@ -236,17 +295,23 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
     # (i) the gates, before a single second is spent sampling. A bad candidate
     # here runs and returns plausible-looking nonsense rather than raising, so
     # nothing else would catch it until the elpd came back uninterpretable.
+    # Chains already archived passed them before they were sampled.
+    archive = config.get("archive") or {}
     site = config["gate_site"]
-    reasons = gates.check(
-        parameters,
-        curves,
-        ages=ages,
-        prop=sampler_kwargs["prop_site"][site],
-        mu=sampler_kwargs["mu_site"][site],
-        draws=config["gate_draws"],
-        seed=config["seed"],
-        inc_max=config["inc_max"],
-        namespace=namespace,
+    reasons = (
+        []
+        if archive
+        else gates.check(
+            parameters,
+            curves,
+            ages=ages,
+            prop=sampler_kwargs["prop_site"][site],
+            mu=sampler_kwargs["mu_site"][site],
+            draws=config["gate_draws"],
+            seed=config["seed"],
+            inc_max=config["inc_max"],
+            namespace=namespace,
+        )
     )
     if reasons:
         return {"gates": list(reasons), "metrics": {}, "artifacts": {}}
@@ -266,33 +331,35 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
 
     # (iii) one fit per split, and every number and picture that fit has to say.
     artifacts: dict[str, str] = {}
-    worst: dict[str, list[float]] = {
-        "rhat_max": [], "ess_tail_min": [], "divergences": [], "mcmc_seconds": []
-    }
+    worst: dict[str, list[float]] = {"rhat_max": [], "ess_tail_min": [], "divergences": [], "mcmc_seconds": []}
     for kind in config["splits"]:
         split = Split(
             kind=kind,
             seed=config["holdout_seed"],
             n_studies=config["n_studies"],
         )
-        result = evaluate(
-            cfg,
-            provider=provider,
-            split=split,
-            n_score_draws=config["n_score_draws"],
-            n_replicates=config["n_replicates"],
-            seed=config["seed"],
-            figures=True,
-        )
+        scoring = {
+            "n_score_draws": config["n_score_draws"],
+            "n_replicates": config["n_replicates"],
+            "seed": config["seed"],
+            "figures": True,
+            "combine_chains": config["combine_chains"],
+        }
+        if kind in archive:
+            kwargs, _, _ = build_model_kwargs(cfg, provider=provider, split=split)
+            result = score(cfg, archived(archive[kind]), kwargs, split=split, **scoring)
+        else:
+            result = evaluate(cfg, provider=provider, split=split, **scoring)
         metrics |= {f"{kind}.{name}": float(v) for name, v in result.metrics.items()}
+        # Training-only, like the LOO they are fitted to: which chains carry the predictive.
+        metrics[f"{kind}.chain_weights"] = tuple(result.info["chain_weights"])
         # The per-unit elpd behind each total. Carried as vectors rather than
         # summarised here because the useful comparison is between candidates,
         # which this process cannot see: it fits one model and knows nothing
         # about the others. The driver holds the leaderboard and does the
         # pairing -- see `elpd_diff` in `examples/estimators.py`.
         metrics |= {
-            f"{kind}.pointwise_{name}": tuple(float(x) for x in vector)
-            for name, vector in result.pointwise.items()
+            f"{kind}.pointwise_{name}": tuple(float(x) for x in vector) for name, vector in result.pointwise.items()
         }
         artifacts |= {
             f"{kind}.{name.removesuffix('.png')}": base64.b64encode(payload).decode()
@@ -311,7 +378,7 @@ def fit(config: dict[str, Any]) -> dict[str, Any]:
         # written from the FitResult already used for scoring, so archiving it
         # never triggers a second fit.
         fit_result = result.fit_result
-        if fit_result is not None:
+        if fit_result is not None and kind not in archive:
             samples = fit_result.draws_by_chain or fit_result.draws
             payload = io.BytesIO()
             np.savez(

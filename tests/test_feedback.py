@@ -14,6 +14,7 @@ import pytest
 from discovery.model import Model
 
 from examples.malaria import feedback, rounds
+from examples.malaria.fit import SCORING
 from examples.malaria.initial import STARTS
 
 #: a number that appears only in held-out metrics, so finding it anywhere in the
@@ -39,7 +40,7 @@ def fitted(sentinel: bool = False) -> pd.DataFrame:
                 {
                     "reference": "Ye_etal_2007", "site_name": "Nouna", "site_i": 0, "study_index": 1, "stream": stream,
                     "age0": age0, "age1": age1, "observed": SENTINEL if sentinel else 0.4,
-                    "pred_q05": 0.2, "pred_q50": 0.35, "pred_q95": 0.6, "pit": 0.7, "elpd": -3.0,
+                    "fitted": 0.5, "pred_q05": 0.2, "pred_q50": 0.35, "pred_q95": 0.6, "pit": 0.7, "elpd": -3.0,
                 }
             )
     return pd.DataFrame(rows)
@@ -52,12 +53,16 @@ def log_eir():
     return draws
 
 
-def write_round(directory, members, split=SPLIT):
-    """A fitted round: `members` is `(source, loo, ok)` per candidate, incumbent first."""
+def write_round(directory, members, split=SPLIT, scoring=SCORING):
+    """A fitted round: `members` is `(source, loo, ok)` per candidate, incumbent first.
+
+    `scoring=None` writes the `fit.json` of a round scored before scoring was recorded.
+    """
     (directory / "artifacts").mkdir(parents=True)
     (directory / "proposals").mkdir()
     (directory / "proposals" / "round.json").write_text(json.dumps({"target": "curves", "start": "griffin"}))
-    (directory / "fit.json").write_text(json.dumps({"split": split, "warmup": 150, "samples": 150, "chains": 4}))
+    meta = {"split": split, "warmup": 150, "samples": 150, "chains": 4}
+    (directory / "fit.json").write_text(json.dumps(meta | ({"scoring": scoring} if scoring else {})))
     with open(directory / "report.jsonl", "w") as handle:
         for index, (source, loo, ok) in enumerate(members):
             stem = f"artifacts/{index:04d}-study"
@@ -78,8 +83,12 @@ def write_round(directory, members, split=SPLIT):
                 "study.pointwise_holdout_prevalence": [SENTINEL],
                 "study.elpd_holdout": SENTINEL,
                 "study.elpd_holdout_se": 1.0,
+                "study.elpd_holdout_mcse": SENTINEL,
                 "study.coverage90_holdout_prev_m": SENTINEL,
                 "study.elpd_loo_train": 5 * loo,
+                "study.elpd_loo_train_mcse": 0.3,
+                "study.chain_weights": [0.4, 0.6],
+                "study.effective_chains": 1.9,
                 "study.kl.b0": 0.4,
                 "parameters": 18.0,
                 "unidentified": 1.0,
@@ -140,8 +149,9 @@ def test_candidates_are_ranked_by_training_loo_against_their_rounds_incumbent(hi
     assert names == ["01-beat_r01-1", "02-beat_r01-2"]
     assert "# better" in (pack / "candidates" / "01-beat_r01-1" / "blocks.py").read_text()
     board = (pack / "FEEDBACK.md").read_text()
-    # +1 nat on each of five units, paired: a lead of +5.0 with no spread
-    assert "+5.0+-" in board and "loo" in board
+    # +1 nat on each of five units, paired: a lead of +5.0 with no spread over
+    # units, so its whole error is the two fits' Monte Carlo errors, 0.3 each
+    assert "+5.0+-0.4 loo" in board
     assert "GateError: prevalence must lie in [0, 1]" in board
 
 
@@ -193,3 +203,38 @@ def test_a_site_the_chains_split_on_is_named_only_if_it_is_a_training_site(histo
     assert "Nouna (Ye_etal_2007): r-hat" in text
     assert text.count("r-hat") == 1
     assert "rhat" in (pack / "incumbent" / "posterior.csv").read_text().splitlines()[0]
+
+
+def test_failures_of_the_machine_are_left_out(history, tmp_path):
+    report = history / "beat" / "r01" / "report.jsonl"
+    with report.open("a") as handle:
+        handle.write(json.dumps({
+            "index": 9, "digest": feedback.digest("x"), "ok": False, "model": "x", "metrics": {},
+            "errors": {"posterior": "Traceback ...\nFileNotFoundError: [Errno 2] No such file or directory: "
+                                    "'~/.cache/arviz/daily_warning.tmp'"},
+        }) + "\n")
+    text = (feedback.write([history], tmp_path / "pack", split=SPLIT, pictures=False) / "FEEDBACK.md").read_text()
+    assert "GateError" in text
+    assert "FileNotFoundError" not in text and "#9" not in text
+
+
+def test_a_round_scored_before_the_current_scoring_is_left_out_until_rescored(tmp_path):
+    root = tmp_path / "runs"
+    write_round(root / "beat" / "old", [(INCUMBENT, -2.0, True), (variant("pooled"), 9.0, True)], scoring=None)
+    write_round(root / "beat" / "new", [(INCUMBENT, -2.0, True), (variant("stacked"), -1.0, True)])
+    pack = feedback.write([root], tmp_path / "pack", split=SPLIT, pictures=False)
+    blocks = "".join(p.read_text() for p in pack.rglob("blocks.py"))
+    assert "stacked" in blocks and "pooled" not in blocks
+    # the table for people keeps both, apart
+    text = rounds.table(feedback.candidates([root]))
+    assert "pooled chains, marginal LOO" in text and "stacked chains, conditional LOO" in text
+
+
+def test_the_residuals_separate_the_mechanism_from_the_study_effect(history, tmp_path):
+    pack = feedback.write([history], tmp_path / "pack", split=SPLIT, pictures=False)
+    text = (pack / "incumbent" / "residuals.txt").read_text()
+    assert "obs/fit" in text and "own study effect" in text
+    # 0.4 observed against 0.5 fitted, in every band
+    assert "0.8" in text.split("By stream and age band:")[1].split("By study:")[0]
+    # each chain's weight beside the EIR it settled on
+    assert "(0.40)" in text and "(0.60)" in text

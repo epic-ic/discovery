@@ -56,11 +56,27 @@ class Budget:
     better.
 
     The one place the MCMC budget is set: `__main__` fits with it, and
-    `agentic` tells the agents it, so the two cannot disagree. 300 + 300 is the
+    `agentic` tells the agents it, so the two cannot disagree. 150 + 150 is the
     screening budget every candidate gets; a candidate worth believing is refitted
     at msinf's own 400 + 400 (`--warmup 400 --samples 400`) before it is called a
     win. `identified` is the KL, in nats, below which a parameter counts as not
     updated by the data.
+
+    Eight chains, jittered starts, and the chains *stacked* rather than pooled.
+    This posterior has modes NUTS does not cross: the incumbent's chains split
+    between a Dicko Doneguebougou EIR near 50 and one near 320, each with its own
+    immunity parameters, at peaks within about two nats of each other, under the
+    study split and on the whole table alike; most candidates do the same at one
+    site or another. Pooled, a score is a mixture weighted by how many chains
+    happened to land in each basin -- the incumbent's held-out elpd is -186 from
+    one and -191 from the other, wider than the spread of the whole leaderboard
+    -- and a pooled PSIS-LOO falls below every one of its own chains. Stacking
+    (`combine_chains`, see `msinf.evaluate`) weights each chain by how well it
+    predicts the training rows, so a score depends on which modes were found and
+    not on how many chains found each. More chains find more of them; they run
+    one thread each, so that costs cores, not wall clock. Every draw is scored
+    (`n_score_draws=None`) because each chain needs enough of its own for a
+    leave-one-out.
     """
 
     table: str = str(data.DEFAULT_TABLE)
@@ -70,16 +86,20 @@ class Budget:
     splits: tuple[str, ...] = data.SPLITS
     holdout_seed: int = 42
     n_studies: int = 3
-    warmup: int = 300
-    samples: int = 300
-    chains: int = 4
+    warmup: int = 150
+    samples: int = 150
+    chains: int = 8
     max_tree_depth: int = 10
     seed: int = 0
     prior_family: str = "xi"
-    #: posterior draws the (ODE-bound) scoring pass runs on, and the predictive
-    #: replicates drawn for the PPC, the coverage and the randomised PIT
-    n_score_draws: int = 200
+    #: posterior draws the (ODE-bound) scoring pass runs on -- every one, a few
+    #: minutes at most -- and the predictive replicates drawn for the PPC, the
+    #: coverage and the randomised PIT
+    n_score_draws: int | None = None
     n_replicates: int = 200
+    #: how the chains are combined into the scored predictive: one of
+    #: `msinf.evaluate.CHAIN_COMBINATIONS`
+    combine_chains: str = "stack"
     #: prior draws for the identifiability comparison. Cheap: the likelihood is
     #: blocked, so none of them costs an equilibrium solve.
     prior_draws: int = 2000
@@ -92,8 +112,24 @@ class Budget:
     inc_max: float = 20.0
 
 
-async def run(source: str, budget: Budget, timeout: float | None = None) -> dict:
-    """Fit one model's source in a child process and read back its report."""
+#: how a round's scores were computed, written into its `fit.json`: rounds scored
+#: differently are not ranked against each other, and `rescore` brings an old
+#: round under this one. A `fit.json` without it was scored by pooling the chains
+#: and leaving each unit out on its own (`msinf.evaluate.score`).
+SCORING = {"combine_chains": Budget.combine_chains, "loo": "conditional"}
+
+
+def scoring_of(meta: dict) -> dict:
+    """How a round's `fit.json` says it was scored."""
+    return meta.get("scoring") or {"combine_chains": "pool", "loo": "marginal"}
+
+
+async def run(source: str, budget: Budget, timeout: float | None = None, samples: dict | None = None) -> dict:
+    """Fit one model's source in a child process and read back its report.
+
+    `samples` maps a split to the archive of chains already sampled for it, which
+    are then scored again rather than fitted (see `rescore`).
+    """
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
@@ -103,7 +139,7 @@ async def run(source: str, budget: Budget, timeout: float | None = None) -> dict
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    request = json.dumps(asdict(budget) | {"source": source}).encode()
+    request = json.dumps(asdict(budget) | {"source": source, "archive": samples or {}}).encode()
     try:
         async with asyncio.timeout(timeout):
             out, err = await process.communicate(request)

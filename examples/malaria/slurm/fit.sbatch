@@ -25,7 +25,7 @@ round=${1:?usage: sbatch fit.sbatch <round> [flags for python -m examples.malari
 shift
 cd "${SLURM_SUBMIT_DIR:-.}"
 
-chains=${CHAINS:-4}
+chains=${CHAINS:-8}
 cpus=${SLURM_CPUS_PER_TASK:-$(nproc)}
 concurrency=${CONCURRENCY:-$(( cpus / chains > 0 ? cpus / chains : 1 ))}
 

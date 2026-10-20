@@ -609,13 +609,17 @@ def local(settings: argparse.Namespace) -> None:
     variants = [variant.get("id") for variant in entry.get("variants") or []]
     if settings.variant and variants and settings.variant not in variants:
         raise SystemExit(f"--variant {settings.variant} is not one of opencode.json's {variants}")
-    print(f"server  {settings.url}: {model}, {settings.context_limit} tokens per request"
-          + (f", variant {settings.variant}" if settings.variant else ""))
+    print(
+        f"server  {settings.url}: {model}, {settings.context_limit} tokens per request"
+        + (f", variant {settings.variant}" if settings.variant else "")
+    )
     if slots and slots < settings.concurrency:
         # Not refused, because a queue is not wrong -- but the agents are told a
         # wall-clock budget, and time spent waiting for a slot comes out of it.
-        print(f"        {slots} slot(s) for {settings.concurrency} agents at once: "
-              f"they will queue inside their {settings.session_timeout / 60:.0f}min budget")
+        print(
+            f"        {slots} slot(s) for {settings.concurrency} agents at once: "
+            f"they will queue inside their {settings.session_timeout / 60:.0f}min budget"
+        )
 
 
 def served(url: str, key: str | None) -> tuple[str, int | None, int | None]:
@@ -776,34 +780,65 @@ def command(settings: argparse.Namespace, path: Path) -> list[str]:
     Prefer `--bare`.
     """
     if settings.cli == "codex":
-        effort = ["-c", f"model_reasoning_effort={json.dumps(settings.reasoning_effort)}"] if settings.reasoning_effort else []
-        return [settings.cli, "exec", "--model", settings.model, *effort, "--cd", str(path),
+        effort = (
+            ["-c", f"model_reasoning_effort={json.dumps(settings.reasoning_effort)}"]
+            if settings.reasoning_effort
+            else []
+        )
+        return [
+            settings.cli,
+            "exec",
+            "--model",
+            settings.model,
+            *effort,
+            "--cd",
+            str(path),
             # The outer experiment environment provides process containment;
             # keep Codex unrestricted so it can execute the copied venv. The
             # no-cross-sandbox rule is explicit in ROLE.md and audited below.
-            "--sandbox", "danger-full-access",
-                "--skip-git-repo-check", "--ephemeral", "--ignore-user-config",
-                "--ignore-rules", "--json"]
+            "--sandbox",
+            "danger-full-access",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--json",
+        ]
     if settings.cli == "opencode":
         # The prompt is the message argument, which is how `opencode run` is
         # documented to take one. The model is passed although the config names
         # it too, so the argv says what was drawn without the config beside it.
         variant = f"#{settings.variant}" if settings.variant else ""
-        return [settings.cli, "run", "--standalone", "--format", "json", "--auto", "--thinking",
-                "--model", f"{OPENCODE_PROVIDER}/{settings.model}{variant}", (path / "PROMPT.md").read_text()]
+        return [
+            settings.cli,
+            "run",
+            "--standalone",
+            "--format",
+            "json",
+            "--auto",
+            "--thinking",
+            "--model",
+            f"{OPENCODE_PROVIDER}/{settings.model}{variant}",
+            (path / "PROMPT.md").read_text(),
+        ]
     argv = [
         settings.cli,
         "-p",
         "--bare" if settings.auth == "api-key" else "--safe-mode",
-        "--model", settings.model,
-        "--setting-sources", "",
+        "--model",
+        settings.model,
+        "--setting-sources",
+        "",
         "--strict-mcp-config",
-        "--tools", TOOLS,
-        "--append-system-prompt", (path / "ROLE.md").read_text(),
+        "--tools",
+        TOOLS,
+        "--append-system-prompt",
+        (path / "ROLE.md").read_text(),
         "--exclude-dynamic-system-prompt-sections",
         "--no-session-persistence",
         "--dangerously-skip-permissions",
-        "--output-format", "stream-json",
+        "--output-format",
+        "stream-json",
         "--verbose",
     ]
     if settings.max_budget_usd:
@@ -1049,9 +1084,7 @@ def conversation(log: Path) -> tuple[list[dict], dict]:
                 "is_error": event.get("is_error"),
                 "subtype": event.get("subtype"),
                 "model_usage": per_model,
-                "web_searches": sum(
-                    (m or {}).get("webSearchRequests", 0) for m in per_model.values()
-                ),
+                "web_searches": sum((m or {}).get("webSearchRequests", 0) for m in per_model.values()),
             }
     if resolved:
         usage["model"] = resolved
@@ -1334,54 +1367,95 @@ def write_lines(path: Path, records: list[dict]) -> Path:
 def version(cli: str) -> str | None:
     """The coding harness's own version, which pins the round as much as the model does."""
     try:
-        return subprocess.run(
-            [cli, "--version"], capture_output=True, text=True, timeout=30, check=False
-        ).stdout.strip() or None
+        return (
+            subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=30, check=False).stdout.strip()
+            or None
+        )
     except (OSError, subprocess.SubprocessError):
         return None
 
 
 def options(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="examples.malaria.agentic", description=__doc__)
-    parser.add_argument("--out", type=Path, default=Path("runs_agentic/01-claude/curves-griffin"),
-                        help="two levels under the sweep root, so sweep.py finds it")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path("runs_agentic/01-claude/curves-griffin"),
+        help="two levels under the sweep root, so sweep.py finds it",
+    )
     parser.add_argument("--agents", type=int, default=8, help="proposals drawn, one agent each")
     parser.add_argument("--target", default="curves", choices=TARGETS)
     parser.add_argument("--start", default="griffin", choices=START_NAMES)
 
     harness = parser.add_argument_group("coding harness")
     harness.add_argument("--cli", default="claude")
-    harness.add_argument("--model", default=None,
-                         help="pinned alias or full id; the id it resolves to is what round.json records. "
-                         f"Defaults to {DEFAULT_MODELS}, or for opencode to whatever the server serves")
-    harness.add_argument("--auth", default="api-key" if os.environ.get("ANTHROPIC_API_KEY") else "session",
-                         choices=("api-key", "session"),
-                         help="api-key uses --bare (stronger isolation); session uses --safe-mode")
-    harness.add_argument("--sandbox", type=Path, default=None,
-                         help=f"neutral root for the agents' directories (default under {SANDBOX_ROOT})")
+    harness.add_argument(
+        "--model",
+        default=None,
+        help="pinned alias or full id; the id it resolves to is what round.json records. "
+        f"Defaults to {DEFAULT_MODELS}, or for opencode to whatever the server serves",
+    )
+    harness.add_argument(
+        "--auth",
+        default="api-key" if os.environ.get("ANTHROPIC_API_KEY") else "session",
+        choices=("api-key", "session"),
+        help="api-key uses --bare (stronger isolation); session uses --safe-mode",
+    )
+    harness.add_argument(
+        "--sandbox",
+        type=Path,
+        default=None,
+        help=f"neutral root for the agents' directories (default under {SANDBOX_ROOT})",
+    )
     harness.add_argument("--concurrency", type=int, default=4, help="agents running at once")
-    harness.add_argument("--session-timeout", type=float, default=None,
-                         help=f"seconds one agent may take, and what it is told; defaults to {SESSION_TIMEOUTS}")
-    harness.add_argument("--reasoning-effort", default="high",
-                         help="codex only: model_reasoning_effort; '' for the model's default")
+    harness.add_argument(
+        "--session-timeout",
+        type=float,
+        default=None,
+        help=f"seconds one agent may take, and what it is told; defaults to {SESSION_TIMEOUTS}",
+    )
+    harness.add_argument(
+        "--reasoning-effort", default="high", help="codex only: model_reasoning_effort; '' for the model's default"
+    )
     harness.add_argument("--max-budget-usd", type=float, default=5.0, help="0 to leave it unbounded")
     harness.add_argument("--keep", action="store_true", help="do not clear the sandbox root first")
 
     local = parser.add_argument_group("local server, --cli opencode only")
-    local.add_argument("--url", default=os.environ.get("DISCOVERY_URL"),
-                       help="OpenAI-compatible base url, e.g. http://127.0.0.1:8001/v1 [$DISCOVERY_URL]")
-    local.add_argument("--api-key-env", default="LLM_API_KEY",
-                       help="the variable holding the server's key; '' for a server without one")
-    local.add_argument("--context-limit", type=int, default=None,
-                       help="tokens one request may use; defaults to what the server reports per slot")
-    local.add_argument("--output-limit", type=int, default=None,
-                       help=f"tokens one reply may use; defaults to opencode.json's, else {OUTPUT_LIMIT}")
-    local.add_argument("--opencode-config", default=str(OPENCODE_CONFIG),
-                       help="the opencode.json each agent's config is built from; '' for none")
-    local.add_argument("--variant", default="max",
-                       help="the opencode.json reasoning variant to run with; '' for the model's default")
-    local.add_argument("--reasoning-field", default="reasoning_content",
-                       help="the message field a reasoning model streams its thinking in; '' for none")
+    local.add_argument(
+        "--url",
+        default=os.environ.get("DISCOVERY_URL"),
+        help="OpenAI-compatible base url, e.g. http://127.0.0.1:8001/v1 [$DISCOVERY_URL]",
+    )
+    local.add_argument(
+        "--api-key-env",
+        default="LLM_API_KEY",
+        help="the variable holding the server's key; '' for a server without one",
+    )
+    local.add_argument(
+        "--context-limit",
+        type=int,
+        default=None,
+        help="tokens one request may use; defaults to what the server reports per slot",
+    )
+    local.add_argument(
+        "--output-limit",
+        type=int,
+        default=None,
+        help=f"tokens one reply may use; defaults to opencode.json's, else {OUTPUT_LIMIT}",
+    )
+    local.add_argument(
+        "--opencode-config",
+        default=str(OPENCODE_CONFIG),
+        help="the opencode.json each agent's config is built from; '' for none",
+    )
+    local.add_argument(
+        "--variant", default="max", help="the opencode.json reasoning variant to run with; '' for the model's default"
+    )
+    local.add_argument(
+        "--reasoning-field",
+        default="reasoning_content",
+        help="the message field a reasoning model streams its thinking in; '' for none",
+    )
 
     inputs = parser.add_argument_group("what the brief describes")
     inputs.add_argument("--table", default=str(data.DEFAULT_TABLE))
@@ -1395,16 +1469,23 @@ def options(argv: list[str] | None = None) -> argparse.Namespace:
     inputs.add_argument("--chains", type=int, default=Budget.chains)
 
     previous = parser.add_argument_group("what earlier rounds found")
-    previous.add_argument("--history", type=Path, nargs="*", default=[],
-                          help="fitted rounds, or directories above them, to build feedback/ from. "
-                          "Training-fold numbers only; rounds fitted under another split are skipped")
-    previous.add_argument("--feedback-top", type=int, default=4,
-                          help="candidates given a directory of their own in feedback/")
+    previous.add_argument(
+        "--history",
+        type=Path,
+        nargs="*",
+        default=[],
+        help="fitted rounds, or directories above them, to build feedback/ from. "
+        "Training-fold numbers only; rounds fitted under another split are skipped",
+    )
+    previous.add_argument(
+        "--feedback-top", type=int, default=8, help="candidates given a directory of their own in feedback/"
+    )
 
     phases = parser.add_argument_group("phases")
     phases.add_argument("--build-only", action="store_true", help="write the sandboxes and stop")
-    phases.add_argument("--collect-only", action="store_true",
-                        help="validate sandboxes an earlier run left, without running anything")
+    phases.add_argument(
+        "--collect-only", action="store_true", help="validate sandboxes an earlier run left, without running anything"
+    )
 
     settings = parser.parse_args(argv)
     settings.splits = tuple(s.strip() for s in settings.splits.split(",") if s.strip())

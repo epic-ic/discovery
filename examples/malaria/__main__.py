@@ -54,6 +54,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import socket
 import sys
@@ -70,7 +71,7 @@ from discovery.search import AgentSearch, Decode, IIDSearch, models
 from examples.estimators import elpd_diff
 from examples.malaria import analysis as setup
 from examples.malaria import data
-from examples.malaria.fit import Budget, Posterior
+from examples.malaria.fit import SCORING, Budget, Posterior
 from examples.malaria.initial import BRIEF, START_NAMES, STARTS, TARGETS
 
 #: the score models are ranked by, and the one number this example has to rank
@@ -81,9 +82,8 @@ from examples.malaria.initial import BRIEF, START_NAMES, STARTS, TARGETS
 #: integrated over a wide prior: machinery every candidate shares, which adds a
 #: common offset and a lot of variance while discriminating weakly between two
 #: reasonable curve families. It separates working candidates from broken ones
-#: cleanly; it does not, on 35 scoring units, reliably order the top few. Until
-#: the per-unit log-likelihoods are reported and differences carry a standard
-#: error, treat the top of the table as unordered.
+#: cleanly; it does not, on 35 scoring units, reliably order the top few -- read
+#: the `vs best` column, whose error carries both the units and the chains.
 RANK = "posterior.study.elpd_holdout"
 
 #: roughly what one fit of this model costs, in minutes, at the default budget.
@@ -419,6 +419,31 @@ def pointwise(scores, kind: str, fold: str = "holdout") -> tuple[float, ...] | N
     return tuple(parts)
 
 
+#: per fold, the metric that says how much its total moves with which chains
+#: happened to run -- see `msinf.evaluate.score`
+MCSE = {"holdout": "elpd_holdout_mcse", "train": "elpd_train_mcse", "loo": "elpd_loo_train_mcse"}
+
+
+def compare(scores, reference, kind: str, fold: str = "holdout") -> tuple[float, float] | None:
+    """`(difference, se)` of one candidate's elpd over another's on `fold`, or `None`.
+
+    The difference is paired over units (`estimators.elpd_diff`), and its error
+    is that pairing's widened by each fit's Monte Carlo error. Chains on this
+    model fall into one mode or another and move a total by nats, which the
+    error over units cannot see; two fits' chains are independent, so their
+    errors add. A report fitted before the Monte Carlo error was recorded
+    contributes none, and says less than it seems to.
+
+    Raises `ValueError` for vectors from different folds, as `elpd_diff` does.
+    """
+    mine, theirs = pointwise(scores, kind, fold), pointwise(reference, kind, fold)
+    if mine is None or theirs is None:
+        return None
+    difference, se = elpd_diff(mine, theirs)
+    chains = [float(s.get(f"posterior.{kind}.{MCSE[fold]}", 0.0)) for s in (scores, reference)]
+    return difference, math.sqrt(se**2 + sum(c**2 for c in chains))
+
+
 def leads(order, kind: str) -> dict[int, str]:
     """Each candidate's lead over the best one, as `diff+-se`, by index.
 
@@ -432,11 +457,10 @@ def leads(order, kind: str) -> dict[int, str]:
     if not scored:
         return {}
     best, *rest = scored
-    reference = pointwise(best.scores, kind)
     out = {best.index: "ref"}
     for evaluation in rest:
         try:
-            difference, se = elpd_diff(pointwise(evaluation.scores, kind), reference)
+            difference, se = compare(evaluation.scores, best.scores, kind)
         except ValueError:
             # Different fold, so not comparable. It should not happen in one
             # run -- every candidate is fitted under the same split -- and if it
@@ -453,9 +477,11 @@ def table(evaluations, origin: dict[int, str], starts: set[int], splits: tuple[s
     each other: different splits answer different questions.
 
     `vs best` is the paired difference against the top row and its standard
-    error, both in nats. Read it before the `elpd` column it qualifies: a lead
-    smaller than about twice its error is not a lead, and on this fold that
-    covers most of the gap between reasonable candidates.
+    error, both in nats, Monte Carlo error included (`compare`). Read it before
+    the `elpd` column it qualifies: a lead smaller than about twice its error is
+    not a lead, and on this fold that covers most of the gap between reasonable
+    candidates. `chains` is how many chains' worth of stacking weight a score
+    rests on; `rhat` well above 1 beside it is a posterior with several modes.
     """
     columns = [("from", None, "{:>8}")]
     columns += [(f"elpd/{kind[:5]}", f"posterior.{kind}.elpd_holdout", "{:>11.1f}") for kind in splits]
@@ -465,6 +491,7 @@ def table(evaluations, origin: dict[int, str], starts: set[int], splits: tuple[s
         ("kl_min", "posterior.kl_min", "{:>7.2f}"),
         ("unid", "posterior.unidentified", "{:>4.0f}"),
         ("rhat", "posterior.rhat_max", "{:>5.2f}"),
+        ("chains", f"posterior.{splits[-1]}.effective_chains", "{:>6.1f}"),
         ("ess_tail", "posterior.ess_tail_min", "{:>8.0f}"),
         ("div", "posterior.divergences", "{:>5.0f}"),
         ("mins", "posterior.mcmc_seconds", "{:>6.1f}"),
@@ -517,6 +544,7 @@ def fitted(settings: argparse.Namespace, splits: tuple[str, ...], budget: Budget
                 "chains": budget.chains,
                 "seed": budget.seed,
                 "inc_max": budget.inc_max,
+                "scoring": SCORING,
                 "host": socket.gethostname(),
                 "fitted_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             },

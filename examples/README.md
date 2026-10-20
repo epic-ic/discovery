@@ -305,19 +305,77 @@ worth looking at are often the ones that failed.
 
 ### The fit
 
-**One fit per split per candidate**: 4 chains, 150 warmup, 150 draws, f64 -- the
+**One fit per split per candidate**: 8 chains, 150 warmup, 150 draws, f64 -- the
 screen -- and 400 + 400 to confirm a candidate worth believing (`fit.Budget` is
-the one place either is set). Griffin's screen took 136 minutes of MCMC on a
-20-core laptop; a cluster node is faster. f64 is not optional -- a novel curve
-family at f32 through two sequential scan recursions produces NaNs, and the
-scoring pass re-runs those recursions once per retained draw. `--fit-timeout`
-defaults to `FIT_MINUTES` (140) × splits × 3.
+the one place either is set). Griffin's screen took 100-135 minutes of MCMC on a
+cluster node. f64 is not optional -- a novel curve family at f32 through two
+sequential scan recursions produces NaNs, and the scoring pass re-runs those
+recursions once per draw. `--fit-timeout` defaults to `FIT_MINUTES` (140) ×
+splits × 3.
 
-At 150 + 150 Griffin itself does not converge: its r-hat is 3.6, all of it one
-site, Mali Doneguebougou, whose chains split between an annual EIR near 330 and
-one near 50 -- its curves fit that site about as well at either. A small lead
-between two screened fits is partly which mode their chains landed in, which is
-one more reason a win is only a win at 400 + 400.
+#### Why the chains do not agree, and what is scored instead
+
+Griffin's r-hat here is 3.4-3.7 in every round, and it is not a sampler that
+needs longer: the posterior has two modes NUTS does not cross. Nearly all of the
+r-hat is one site, Mali Dicko Doneguebougou (`log_eir[9]`, prior median EIR
+142), whose chains sit at an annual EIR near 50 or near 320, each with its own
+immunity parameters (`phi1` 0.003 against 0.006, `ID0` about 100 against 150)
+and with every other site's EIR shifted 20-30% to match. Climbing the log
+density from each gives peaks within 2.3 nats of each other under the study
+split and within 1.7 on the whole table, so this is not an artefact of holding
+studies out.
+
+msinf's own Griffin fits (`../msinf/outputs/2026-09-30/15-15-08`, `2026-10-14/15-54-43`,
+whole table, `init_strategy: griffin`) report r-hat near 1 because all four
+chains start from the *same* point -- `init_to_value`, no jitter -- and fall into
+the same basin (Doneguebougou near 50 in all four). R-hat compares chains; it
+cannot see a mode none of them visited. Their immunity parameters also differ
+from the study-split fits' (`ID0` 16 against 100, `b0` 0.83 against 0.4):
+that is the held-out studies leaving, Dakar's two near-zero-EIR sites among them.
+Started from msinf's posterior, the study-split density climbs to the same
+place the discovery fits are in.
+
+The fits here therefore start chains apart (`griffin_jitter`: Griffin's values,
+displaced per chain by 0.5 on the unconstrained scale), so more than one mode is
+found, and **score each chain on its own** (`msinf.evaluate.score`,
+`combine_chains="stack"`):
+
+* *Pooling them was wrong for the feedback.* PSIS-LOO over draws from two modes
+  is dominated by whichever mode fits the left-out unit worst. Pooled, the
+  incumbent's training LOO fell below every one of its own chains', and a
+  candidate with one chain in a poor mode lost 60-90 nats to it: refit-01's #1,
+  #9 and #10 read 67-92 nats *behind* the incumbent, and are 1-11 nats ahead of
+  it once each chain is left out on its own. That was the leaderboard agents
+  were shown.
+* *The chains are weighted by stacking* (Yao, Vehtari & Gelman 2022) on their
+  training leave-one-out, Dirichlet(1.5)-regularised so that chains in the same
+  mode share their weight. A chain stuck somewhere the training rows reject
+  gets none; chains that predict alike are not counted twice.
+* *Leave-one-out leaves a unit out given the rest of its study.* The fitted
+  likelihood shares one study effect across a study's units, so the ratio that
+  removes unit *i* is `p(y_i | y_{study,-i}, θ)`, not the unit's marginal
+  (Bürkner, Gabry & Vehtari 2021). It is ~75 nats higher than the old number,
+  because the rest of a study tells you its level.
+* *What stacking does not do is make the held-out score independent of luck.*
+  Over every 4-of-8 subset of refit-01's chains the incumbent's held-out total
+  moves with SD ≈ 0.9 nats, and a candidate's lead over it with SD ≈ 1.1-1.3,
+  pooled or stacked alike: per-chain training LOO is too noisy to tell modes
+  apart that differ by 5 nats held out (the incumbent's EIR-320 chains score
+  -186 held out, its EIR-50 chains -191). So every total now carries a Monte
+  Carlo error, `_mcse`, from a leave-one-chain-out jackknife, and every paired
+  difference -- `vs best`, `rounds`, `feedback` -- adds both fits' to its error
+  over units. More chains shrink it; nothing else on offer does.
+
+A small lead between two screened fits is therefore partly which modes their
+chains found, which is one more reason a win is only a win at 400 + 400.
+
+Rounds scored before this (`fit.json` without `"scoring"`) are not ranked
+against rounds scored after it. The chains are archived, so they need no
+refit, only a re-score:
+
+```sh
+uv run python -m examples.malaria.rescore runs/beat    # keeps report.pooled.jsonl and artifacts.pooled/
+```
 
 Every number comes from `msinf.evaluate`, the same entry point msinf's own
 `+experiment=holdout_*` runs go through. If a candidate's `elpd_holdout` were
@@ -326,14 +384,16 @@ not be measuring what the report claims.
 
 | metric | what it answers |
 | --- | --- |
-| `<split>.elpd_holdout`, `_incidence`, `_prevalence` | held-out density with the random effects marginalised exactly as the fitted likelihood marginalises them. Prevalence is scored per row; incidence per **cell**, since `v_jk` does not factorise. `_per_cell` and `_per_row` are the same numbers per unit. |
+| `<split>.elpd_holdout`, `_incidence`, `_prevalence` | held-out density under the chain-stacked predictive. Each unit's study effect is integrated out on its own, as for a unit of a study not yet seen; the fitted likelihood integrates it once per study. Prevalence is scored per row; incidence per **cell**, since `v_jk` does not factorise. `_per_cell` and `_per_row` are the same numbers per unit. `_pooled` is what equal weight per draw scores. |
 | `<split>.elpd_holdout_se` | that total's standard error over its units, so a total is not read as if it were exact. |
+| `<split>.elpd_*_mcse` | how much that total moves with which chains happened to run: a leave-one-chain-out jackknife. Added to every paired difference's error. |
+| `<split>.chain_weights`, `effective_chains` | each chain's stacking weight, from training LOO alone, and `1 / Σw²`. |
 | `<split>.pointwise_holdout_*` | the per-unit vectors the totals sum, in the fold's own order — the only vector-valued metrics here. Two candidates under the same split line up elementwise, which is what lets the table's `vs best` column pair them. |
 | `<split>.coverage90_holdout_*` | how often the held-out count fell inside the 90% predictive interval. |
-| `<split>.elpd_loo_train`, `pointwise_loo_*`, `loo_khat_over_0p7` | PSIS-LOO on the training units, from the per-draw log-likelihoods the scoring pass already has: the training score that does not reward an extra parameter for its own sake, and the one agents are ranked on. The last counts units whose estimate is unreliable. |
-| artifacts `<split>.fitted_train`, `<split>.fitted_holdout` | every observed row beside its 5/50/95% posterior predictive (study effects redrawn, as for a new study), randomised PIT and elpd, as CSV. The training one is what `feedback.py` shows agents. |
+| `<split>.elpd_loo_train`, `pointwise_loo_*`, `loo_khat_over_0p7` | PSIS-LOO on the training units, each left out given the rest of its study, within each chain and stacked: the training score that does not reward an extra parameter for its own sake, and the one agents are ranked on. The last counts units whose estimate is unreliable. `elpd_loo_train_pooled` is the cross-chain PSIS, kept to show what it did. |
+| artifacts `<split>.fitted_train`, `<split>.fitted_holdout` | every observed row beside `fitted`, its expected rate with its own study's effect as the fit inferred it, and its 5/50/95% posterior predictive (study effects redrawn, as for a new study), randomised PIT and elpd, as CSV. The training one is what `feedback.py` shows agents. |
 | `<split>.kl.<parameter>`, `kl_min`, `unidentified` | the information the data added to each of the *candidate's own* parameters, in nats, unconstrained. The scaffolding's parameters are excluded: they are identical for every candidate and counting them would flatter a model that declared nothing. |
-| `rhat_max`, `ess_tail_min`, `divergences` | the worst of the splits, not the average: a candidate that converged under one fold and not another has not converged. |
+| `rhat_max`, `ess_tail_min`, `divergences` | the worst of the splits, not the average. Across chains that settled in different modes r-hat is large by construction; read it beside `effective_chains`. |
 | `mcmc_seconds`, `total_seconds`, `parameters` | what it cost, and how much of it the candidate declared. |
 
 Prior draws for the identifiability comparison are taken with the candidate's
@@ -403,13 +463,13 @@ uv run python -m examples.malaria.rounds runs/beat
 `--concurrency 4` matches the server's slots; more agents queue. Each agent may
 run for four hours (`--session-timeout`, in seconds) and is told so, with no cap
 on tool calls or thinking, at the `max` reasoning variant (`--variant high` for
-less, `''` for the model's default). A local fit is four chains of one thread
-each and peaks near 4 GB, so `--concurrency` on the fit is a memory question.
+less, `''` for the model's default). A local fit is eight chains of one thread
+each, so `--concurrency` on the fit is a question of cores and memory.
 
 **(b) OpenCode proposals, fitted on the cluster.** The head node,
 `wpia-lxhn.hpc.dide.ic.ac.uk`, shares its filesystem with every compute node
 but not with this machine, so `remote.sh` copies a round up, submits it, and
-copies the report back. A node runs `cpus / 4` fits at once: 24 on 96 CPUs.
+copies the report back. A node runs `cpus / 8` fits at once: 12 on 96 CPUs.
 
 ```sh
 examples/malaria/slurm/remote.sh code             # once, and after changing code: copies this checkout and ../msinf up, uv syncs
@@ -468,9 +528,10 @@ uv run python -m examples.malaria.rounds runs/beat
 make the confirmation fold the selection fold. A second holdout seed
 (`--holdout-seed 7` on the fit) says whether a lead depends on which three
 studies were drawn -- but it is not unseen data: the agents' feedback held those
-studies as training rows. Done means a held-out lead past `!` at 400 + 400, with
-`rhat` at most 1.01, no divergences, and no more unidentified parameters than
-Griffin.
+studies as training rows. Done means a held-out lead past `!` at 400 + 400 --
+its error carrying both fits' Monte Carlo error -- no divergences, and no more
+unidentified parameters than Griffin. Not `rhat` at 1.01: across chains that
+found different modes it cannot be, and Griffin's own never is.
 
 #### What an agent is given
 
@@ -480,14 +541,20 @@ in `data/`, a venv with numpy, pandas, jax, numpyro and dmeq, `check.py` -- the
 runner's own `gates.check`, so no fit is spent on a candidate a gate would
 refuse -- and with `--history`, `feedback/`:
 
-* `FEEDBACK.md`: a leaderboard by training PSIS-LOO paired against the
-  incumbent, where the incumbent misses the training rows, and why the failed
-  candidates failed;
+* `FEEDBACK.md`: a leaderboard by training leave-one-out (per chain, stacked,
+  each unit left out given the rest of its study) paired against the incumbent
+  with an error that includes the chains', where the incumbent misses the
+  training rows, and why the failed candidates failed. Rounds scored before the
+  current scoring are left out until `rescore` has been run on them;
 * `incumbent/` and `candidates/<rank>-*/`: each one's blocks in `proposal.py`'s
   format, its posterior, `fitted_train.csv` -- every training row's observed
-  rate beside its 5/50/95% posterior predictive, PIT and elpd, from the
-  candidate's own curves -- and a residual summary by stream, age band and
-  study. The incumbent also gets msinf's fitted curves over age as PNGs.
+  rate beside its fitted rate with its own study's effect and its 5/50/95%
+  posterior predictive, PIT and elpd, from the candidate's own curves -- and a
+  residual summary by stream, age band and study. `obs/fit` there is the misfit
+  the mechanism owns; the predictive columns redraw the study effect and so
+  also carry the between-study spread every candidate shares. Sites whose
+  chains split between modes are listed with each chain's weight. The incumbent
+  also gets msinf's fitted curves over age as PNGs.
 
 **What it is never given is the held-out fold** -- not its rows, not any
 candidate's held-out score, not a posterior or plot from a fit that saw it.

@@ -27,9 +27,9 @@ import argparse
 import json
 from pathlib import Path
 
-from examples.estimators import elpd_diff
 from examples.malaria import data, feedback
-from examples.malaria.__main__ import pointwise
+from examples.malaria.__main__ import compare
+from examples.malaria.fit import scoring_of
 from examples.malaria.evaluation import METRICS, metrics, signed, verdict
 
 #: the folds a difference is shown on, in column order
@@ -43,21 +43,25 @@ def fit_of(directory: Path) -> dict:
 
 
 def group(row: dict) -> str:
-    """The rounds a row may be ranked against: same split, same budget."""
+    """The rounds a row may be ranked against: same split, same budget, same scoring."""
     meta = fit_of(row["round"])
     if not meta:
         return "unrecorded split and budget"
-    return f"{meta['split']}, {meta['warmup']}+{meta['samples']} x {meta['chains']} chains"
+    scored = scoring_of(meta)
+    return (
+        f"{meta['split']}, {meta['warmup']}+{meta['samples']} x {meta['chains']} chains, "
+        f"{scored['combine_chains']}ed chains, {scored['loo']} LOO"
+    )
 
 
 def cell(row: dict, reference: dict | None, fold: str) -> str:
     """One paired difference as `d+-se`, with `!` past `evaluation.Z`."""
     if reference is None or row is reference:
         return "-"
-    mine, theirs = pointwise(row["scores"], feedback.KIND, fold), pointwise(reference["scores"], feedback.KIND, fold)
-    if mine is None or theirs is None:
+    found = compare(row["scores"], reference["scores"], feedback.KIND, fold)
+    if found is None:
         return "-"
-    difference, se = elpd_diff(mine, theirs)
+    difference, se = found
     return f"{signed(difference)}+-{se:.1f}" + ("!" if verdict(difference, se) else " ")
 
 

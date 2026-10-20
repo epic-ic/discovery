@@ -64,5 +64,5 @@ def test_the_batch_job_is_the_local_fit_with_the_nodes_cpus():
     fit = done.stdout.strip().splitlines()[-1]
     assert fit == (
         "-m examples.malaria --proposals runs/beat/r01/proposals --out runs/beat/r01 "
-        "--chains 4 --concurrency 24 --warmup 400"
+        "--chains 8 --concurrency 12 --warmup 400"
     )
