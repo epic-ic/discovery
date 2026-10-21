@@ -317,6 +317,64 @@ def test_the_table_marks_a_lead_inside_its_own_error():
     assert abs(float(last)) > 4.0 * float(se)
 
 
+def test_a_lead_carries_both_fits_monte_carlo_error():
+    """Which mode the chains fell into moves a total by nats, which the units cannot see.
+
+    A lead of one nat on every unit has no spread over units, so pairing alone
+    calls it certain; the two fits' chain-to-chain errors are what says otherwise.
+    """
+    def scores(level, mcse=None):
+        found = {
+            "posterior.study.pointwise_holdout_incidence": (level,) * 16,
+            "posterior.study.pointwise_holdout_prevalence": (level,) * 19,
+        }
+        return found | ({"posterior.study.elpd_holdout_mcse": mcse} if mcse is not None else {})
+
+    difference, se = driver.compare(scores(-5.0), scores(-6.0), "study")
+    assert difference == pytest.approx(35.0) and se == pytest.approx(0.0)
+    difference, se = driver.compare(scores(-5.0, 3.0), scores(-6.0, 4.0), "study")
+    assert difference == pytest.approx(35.0) and se == pytest.approx(5.0)
+    assert driver.compare({}, scores(-6.0), "study") is None
+
+
+def test_rescoring_keeps_what_the_archive_cannot_say_and_replaces_the_rest():
+    """Divergences and timings describe the fit and are not archived; the scores are recomputed."""
+    from examples.malaria.rescore import merge
+
+    record = {
+        "index": 3,
+        "metrics": {
+            "posterior": {
+                "study.elpd_holdout": -190.0,
+                "study.elpd_loo_train": -816.0,
+                "divergences": 2.0,
+                "mcmc_seconds": 6000.0,
+                "study.n_divergent": 2.0,
+                "study.samples.npz": {"artifact": "artifacts/0003-posterior.study.samples.npz.npz"},
+                "study.fitted_train": {"artifact": "artifacts/0003-posterior.study.fitted_train.csv"},
+            }
+        },
+    }
+    rescored = {
+        "metrics": {
+            "study.elpd_holdout": -189.2,
+            "study.elpd_loo_train": -731.5,
+            "divergences": 0.0,
+            "mcmc_seconds": 0.0,
+            "study.n_divergent": 0.0,
+            "study.chain_weights": (0.5, 0.5),
+        },
+        "artifacts": {},
+    }
+    written = {"study.fitted_train": {"artifact": "artifacts/0003-posterior.study.fitted_train.csv", "new": True}}
+    merged = merge(record, rescored, ("study",), written)["metrics"]["posterior"]
+    assert merged["study.elpd_holdout"] == -189.2 and merged["study.elpd_loo_train"] == -731.5
+    assert merged["divergences"] == 2.0 and merged["mcmc_seconds"] == 6000.0 and merged["study.n_divergent"] == 2.0
+    assert merged["study.chain_weights"] == [0.5, 0.5]
+    assert merged["study.fitted_train"]["new"]
+    assert merged["study.samples.npz"] == record["metrics"]["posterior"]["study.samples.npz"]
+
+
 def test_the_table_pairs_on_the_split_it_ranks_on():
     """Two constants that would be a silent bug if they ever disagreed."""
     assert driver.RANK == f"posterior.{driver.RANKED_SPLIT}.elpd_holdout"
@@ -911,3 +969,18 @@ def test_an_absorbing_terminal_class_is_refused():
     with use_backend("numpy"):
         with pytest.raises(ValueError, match="absorbing"):
             age_proportions(ages, mu)
+
+
+def test_the_arviz_stamp_is_written_so_arviz_does_not_race_to_write_it(tmp_path, monkeypatch):
+    """Concurrent fits renaming arviz's one shared `daily_warning.tmp` fail on import."""
+    import datetime
+
+    from examples.malaria.runner import stamp_arviz
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    stamp_arviz()
+    stamp_arviz()  # a stamp already there is overwritten, not an error
+
+    stamp = tmp_path / "arviz" / "daily_warning"
+    assert stamp.read_text() == datetime.date.today().isoformat()
+    assert list(stamp.parent.iterdir()) == [stamp]

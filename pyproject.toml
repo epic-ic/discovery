@@ -44,6 +44,9 @@ examples = [
 #: Both projects are `>=3.11`, so this is one environment and one interpreter.
 malaria = [
     "msinf",
+    # msinf calls the 0.x API (`arviz.stats.psislw`, `az.ess(method="tail")`)
+    # and declares only `arviz>=0.18`, which now resolves to 1.x.
+    "arviz>=0.18,<1",
 ]
 
 [tool.uv.sources]

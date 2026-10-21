@@ -28,9 +28,8 @@ it identically. The scratch seeds are different models and keep their rows.
 import argparse
 from pathlib import Path
 
-from examples.estimators import elpd_diff
 from examples.malaria import frontier, sweep
-from examples.malaria.__main__ import RANKED_SPLIT, pointwise
+from examples.malaria.__main__ import RANKED_SPLIT, compare, pointwise
 
 #: standard errors a paired difference must clear to be marked. Two is the
 #: conventional ~95%; `estimators.elpd_diff` would ask for nearer four on a fold
@@ -94,7 +93,8 @@ def ranked(rows: list[dict]) -> list[dict]:
 
 def differences(row: dict, reference: dict) -> tuple[tuple[float, float], ...]:
     """`(difference, se)` from `reference` on each of `FOLDS`."""
-    return tuple(elpd_diff(a, b) for a, b in zip(vectors(row), vectors(reference)))
+    vectors(row), vectors(reference)  # refuses a report that predates the vectors, by name
+    return tuple(compare(row["scores"], reference["scores"], RANKED_SPLIT, fold) for fold in FOLDS)
 
 
 def verdict(difference: float, se: float) -> int:

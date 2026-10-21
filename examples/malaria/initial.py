@@ -732,11 +732,16 @@ post-warmup draws, the same budget for every candidate. One fit takes roughly
 {minutes:.0f} minutes, so a candidate that is much more expensive to solve will
 be killed rather than scored.
 
-Scored on held-out predictive likelihood with the study random effects
-integrated out, on whether the predictive intervals cover the held-out counts,
-on whether every parameter is identified -- the posterior has to differ from the
-prior -- and on whether the chains converged. More parameters than the data can
-pin down scores worse, not better.
+Ranked on held-out predictive likelihood with the study random effects
+integrated out, as a paired difference over the incumbent whose error counts
+both which units were scored and which way the chains happened to fall.
+Reported beside it, not ranked on: whether the predictive intervals cover the
+held-out counts, whether every parameter is identified -- the posterior has to
+differ from the prior -- and how the chains mixed. This posterior can have more
+than one mode, a site fitting about as well at two transmission levels, and
+NUTS does not cross between them; chains that settle apart are weighted by how
+well each predicts the training rows rather than counted. More parameters than
+the data can pin down still score worse, not better.
 
 Before any of that, a candidate is run through cheap gates on the curves alone:
 they must be finite; prevalence must lie in [0, 1]; incidence must lie in

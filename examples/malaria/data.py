@@ -23,15 +23,28 @@ from pathlib import Path
 #: where the example's own copies of the inputs live
 HERE = Path(__file__).resolve().parent
 
+#: msinf's own inputs, in the sibling checkout `pyproject.toml` installs msinf
+#: from -- so a machine that can fit at all already has them, the cluster included.
+MSINF_INPUTS = HERE.parents[2] / "msinf" / "artifacts" / "inputs"
+
+
+def default(variable: str, name: str) -> Path:
+    """`$variable`, else a copy beside this module, else msinf's own."""
+    if variable in os.environ:
+        return Path(os.environ[variable])
+    return HERE / name if (HERE / name).is_file() else MSINF_INPUTS / name
+
+
 #: the <=20y study table. Already truncated on disk -- there is no `truncate_age`
 #: anywhere in msinf, and adding one here would be a second way to draw the same
-#: boundary that could disagree with the CSV.
-DEFAULT_TABLE = Path(os.environ.get("MALARIA_TABLE", HERE / "study_data_2014_age_le20.csv"))
+#: boundary that could disagree with the CSV. msinf's `study_data_2014.csv` is
+#: that table: 223 rows, every band ending by 20y.
+DEFAULT_TABLE = default("MALARIA_TABLE", "study_data_2014.csv")
 
 #: per-site EIR priors, resolved over every site in the table including the ones
 #: the study holdout removes from the fit: scoring a held-out site means drawing
 #: its `log_eir` from the prior, so the prior row has to exist.
-DEFAULT_EIR_PRIORS = Path(os.environ.get("MALARIA_EIR_PRIORS", HERE / "eir_site_priors_griffin2014.csv"))
+DEFAULT_EIR_PRIORS = default("MALARIA_EIR_PRIORS", "eir_site_priors_griffin2014.csv")
 
 #: optional per-site WPP death rates on the model age grid; msinf's `null`
 #: default keeps dmeq's uniform rate, which is what every published run used.

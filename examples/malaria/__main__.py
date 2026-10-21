@@ -54,8 +54,11 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
+import socket
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -68,7 +71,7 @@ from discovery.search import AgentSearch, Decode, IIDSearch, models
 from examples.estimators import elpd_diff
 from examples.malaria import analysis as setup
 from examples.malaria import data
-from examples.malaria.fit import Budget, Posterior
+from examples.malaria.fit import SCORING, Budget, Posterior
 from examples.malaria.initial import BRIEF, START_NAMES, STARTS, TARGETS
 
 #: the score models are ranked by, and the one number this example has to rank
@@ -79,16 +82,19 @@ from examples.malaria.initial import BRIEF, START_NAMES, STARTS, TARGETS
 #: integrated over a wide prior: machinery every candidate shares, which adds a
 #: common offset and a lot of variance while discriminating weakly between two
 #: reasonable curve families. It separates working candidates from broken ones
-#: cleanly; it does not, on 35 scoring units, reliably order the top few. Until
-#: the per-unit log-likelihoods are reported and differences carry a standard
-#: error, treat the top of the table as unordered.
+#: cleanly; it does not, on 35 scoring units, reliably order the top few -- read
+#: the `vs best` column, whose error carries both the units and the chains.
 RANK = "posterior.study.elpd_holdout"
 
 #: roughly what one fit of this model costs, in minutes, at the default budget.
 #: Load-bearing: it sizes `--fit-timeout` and it is what the proposer is told,
 #: so a candidate that is much more expensive to solve gets killed rather than
 #: silently taking the run's whole afternoon.
-FIT_MINUTES = 20.0
+#:
+#: Measured, not guessed: Griffin at 150 + 150 x 4 chains took 136 minutes of
+#: MCMC on a 20-core laptop that was doing other work (runs/beat/r00). A
+#: dedicated cluster core is faster, which only makes the timeout generous.
+FIT_MINUTES = 140.0
 
 #: how much longer than `FIT_MINUTES x splits` a candidate may take before it is
 #: killed. Compilation, the ODE-bound scoring pass and a curve family slower than
@@ -156,7 +162,7 @@ def options(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument(
         "--start",
         choices=START_NAMES,
-        default="scratch",
+        default="griffin",
         help="scratch: deliberately poor -- no immunity and no age structure at "
         "the curves target, immunity that does not accumulate at the immunity "
         "one. griffin: the incumbent, for correction rather than discovery. "
@@ -167,15 +173,19 @@ def options(argv: list[str] | None = None) -> argparse.Namespace:
     fit = parser.add_argument_group("fit, identical for every candidate")
     fit.add_argument("--table", default=str(data.DEFAULT_TABLE), help="the <=20y study table")
     fit.add_argument("--eir-priors", default=str(data.DEFAULT_EIR_PRIORS))
-    fit.add_argument("--mortality", default=data.DEFAULT_MORTALITY,
-                     help="per-site WPP death rates; omitted keeps dmeq's uniform rate")
-    fit.add_argument("--splits", default=",".join(data.SPLITS),
-                     help="comma separated; one fit each, reported separately")
+    fit.add_argument(
+        "--mortality",
+        default=data.DEFAULT_MORTALITY,
+        help="per-site WPP death rates; omitted keeps dmeq's uniform rate",
+    )
+    fit.add_argument(
+        "--splits", default=",".join(data.SPLITS), help="comma separated; one fit each, reported separately"
+    )
     fit.add_argument("--holdout-seed", type=int, default=42, help="the study-split fold")
     fit.add_argument("--n-studies", type=int, default=3, help="studies held out by the study split")
-    fit.add_argument("--warmup", type=int, default=400)
-    fit.add_argument("--samples", type=int, default=400, help="post-warmup draws per chain")
-    fit.add_argument("--chains", type=int, default=4)
+    fit.add_argument("--warmup", type=int, default=Budget.warmup, help="warmup draws per chain")
+    fit.add_argument("--samples", type=int, default=Budget.samples, help="post-warmup draws per chain")
+    fit.add_argument("--chains", type=int, default=Budget.chains)
     fit.add_argument("--seed", type=int, default=0)
     fit.add_argument("--max-parameters", type=int, default=200)
     fit.add_argument(
@@ -187,10 +197,18 @@ def options(argv: list[str] | None = None) -> argparse.Namespace:
         "fails -- which is how to ask what a candidate the gate rejected would have "
         "scored, at the price of the fit it was there to save",
     )
-    fit.add_argument("--concurrency", type=int, default=1,
-                     help="fits in flight at once; each is chains x one thread and a lot of memory")
-    fit.add_argument("--fit-timeout", type=float, default=None,
-                     help=f"seconds; defaults to {FIT_MINUTES:.0f}min x splits x {HEADROOM:g}")
+    fit.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="fits in flight at once; each is chains x one thread and a lot of memory",
+    )
+    fit.add_argument(
+        "--fit-timeout",
+        type=float,
+        default=None,
+        help=f"seconds; defaults to {FIT_MINUTES:.0f}min x splits x {HEADROOM:g}",
+    )
 
     parser.add_argument("--out", type=Path, default=Path("runs/malaria"))
     return parser.parse_args(argv)
@@ -401,6 +419,31 @@ def pointwise(scores, kind: str, fold: str = "holdout") -> tuple[float, ...] | N
     return tuple(parts)
 
 
+#: per fold, the metric that says how much its total moves with which chains
+#: happened to run -- see `msinf.evaluate.score`
+MCSE = {"holdout": "elpd_holdout_mcse", "train": "elpd_train_mcse", "loo": "elpd_loo_train_mcse"}
+
+
+def compare(scores, reference, kind: str, fold: str = "holdout") -> tuple[float, float] | None:
+    """`(difference, se)` of one candidate's elpd over another's on `fold`, or `None`.
+
+    The difference is paired over units (`estimators.elpd_diff`), and its error
+    is that pairing's widened by each fit's Monte Carlo error. Chains on this
+    model fall into one mode or another and move a total by nats, which the
+    error over units cannot see; two fits' chains are independent, so their
+    errors add. A report fitted before the Monte Carlo error was recorded
+    contributes none, and says less than it seems to.
+
+    Raises `ValueError` for vectors from different folds, as `elpd_diff` does.
+    """
+    mine, theirs = pointwise(scores, kind, fold), pointwise(reference, kind, fold)
+    if mine is None or theirs is None:
+        return None
+    difference, se = elpd_diff(mine, theirs)
+    chains = [float(s.get(f"posterior.{kind}.{MCSE[fold]}", 0.0)) for s in (scores, reference)]
+    return difference, math.sqrt(se**2 + sum(c**2 for c in chains))
+
+
 def leads(order, kind: str) -> dict[int, str]:
     """Each candidate's lead over the best one, as `diff+-se`, by index.
 
@@ -414,11 +457,10 @@ def leads(order, kind: str) -> dict[int, str]:
     if not scored:
         return {}
     best, *rest = scored
-    reference = pointwise(best.scores, kind)
     out = {best.index: "ref"}
     for evaluation in rest:
         try:
-            difference, se = elpd_diff(pointwise(evaluation.scores, kind), reference)
+            difference, se = compare(evaluation.scores, best.scores, kind)
         except ValueError:
             # Different fold, so not comparable. It should not happen in one
             # run -- every candidate is fitted under the same split -- and if it
@@ -435,9 +477,11 @@ def table(evaluations, origin: dict[int, str], starts: set[int], splits: tuple[s
     each other: different splits answer different questions.
 
     `vs best` is the paired difference against the top row and its standard
-    error, both in nats. Read it before the `elpd` column it qualifies: a lead
-    smaller than about twice its error is not a lead, and on this fold that
-    covers most of the gap between reasonable candidates.
+    error, both in nats, Monte Carlo error included (`compare`). Read it before
+    the `elpd` column it qualifies: a lead smaller than about twice its error is
+    not a lead, and on this fold that covers most of the gap between reasonable
+    candidates. `chains` is how many chains' worth of stacking weight a score
+    rests on; `rhat` well above 1 beside it is a posterior with several modes.
     """
     columns = [("from", None, "{:>8}")]
     columns += [(f"elpd/{kind[:5]}", f"posterior.{kind}.elpd_holdout", "{:>11.1f}") for kind in splits]
@@ -447,6 +491,7 @@ def table(evaluations, origin: dict[int, str], starts: set[int], splits: tuple[s
         ("kl_min", "posterior.kl_min", "{:>7.2f}"),
         ("unid", "posterior.unidentified", "{:>4.0f}"),
         ("rhat", "posterior.rhat_max", "{:>5.2f}"),
+        ("chains", f"posterior.{splits[-1]}.effective_chains", "{:>6.1f}"),
         ("ess_tail", "posterior.ess_tail_min", "{:>8.0f}"),
         ("div", "posterior.divergences", "{:>5.0f}"),
         ("mins", "posterior.mcmc_seconds", "{:>6.1f}"),
@@ -455,7 +500,7 @@ def table(evaluations, origin: dict[int, str], starts: set[int], splits: tuple[s
     order = sorted(evaluations, key=lambda e: (not e.ok, -e.scores.get(RANK, float("-inf"))))
     against_best = leads(order, RANKED_SPLIT)
 
-    lines = ["  #  " + " ".join(f"{name:>{len(fmt.format(0)) }}" for name, _, fmt in columns)]
+    lines = ["  #  " + " ".join(f"{name:>{len(fmt.format(0))}}" for name, _, fmt in columns)]
     for evaluation in order:
         label = f"{evaluation.index:>3}" + ("*" if evaluation.index in starts else " ")
         parent = origin.get(evaluation.index, "?")
@@ -478,14 +523,45 @@ def table(evaluations, origin: dict[int, str], starts: set[int], splits: tuple[s
     return "\n".join(lines)
 
 
+def fitted(settings: argparse.Namespace, splits: tuple[str, ...], budget: Budget) -> Path:
+    """Write down how the round beside it was fitted, as `fit.json`.
+
+    The report says what each candidate scored and not under what, and two rounds
+    are comparable only under the same split and budget. `feedback` reads the
+    split before it shows an agent anything -- another fold's training rows are
+    this fold's held-out ones -- and `rounds` groups its table by both.
+    """
+    path = settings.out / "fit.json"
+    path.write_text(
+        json.dumps(
+            {
+                "split": data.label(splits[0], settings.holdout_seed, settings.n_studies),
+                "splits": list(splits),
+                "holdout_seed": settings.holdout_seed,
+                "n_studies": settings.n_studies,
+                "warmup": budget.warmup,
+                "samples": budget.samples,
+                "chains": budget.chains,
+                "seed": budget.seed,
+                "inc_max": budget.inc_max,
+                "scoring": SCORING,
+                "host": socket.gethostname(),
+                "fitted_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return path
+
+
 async def main(argv: list[str] | None = None) -> int:
     settings = options(argv)
     #: whether this run talks to the inference server at all. A round is either
     #: drawn now, read back from one drawn earlier, or skipped entirely.
     searching = not settings.no_search and settings.proposals is None
     if settings.propose_only and not searching:
-        raise SystemExit("--propose-only draws a round, so it cannot be used with "
-                         "--no-search or --proposals")
+        raise SystemExit("--propose-only draws a round, so it cannot be used with --no-search or --proposals")
     if searching and not settings.url:
         raise SystemExit("--url (or $DISCOVERY_URL) is required unless --no-search or --proposals")
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -594,9 +670,7 @@ async def main(argv: list[str] | None = None) -> int:
         # server that was down for ten seconds becomes a report that says the
         # incumbent won. Refuse it here, where the reason is still on screen.
         if len(candidates) == 1:
-            raise SystemExit(
-                f"no proposals parsed: nothing to write. See {settings.out}/failures.jsonl"
-            )
+            raise SystemExit(f"no proposals parsed: nothing to write. See {settings.out}/failures.jsonl")
         written = save(candidates, origin, settings, settings.out)
         print(f"proposals: {written}")
         print(f"fit them with --proposals {written} (no server needed)")
@@ -628,6 +702,7 @@ async def main(argv: list[str] | None = None) -> int:
     )
 
     report = write(evaluations, settings.out / "report.jsonl")
+    fitted(settings, splits, budget)
     print(f"\n{table(evaluations, origin, starts, splits)}\n\n* the models the search started from")
     print(f"report: {report}")
     return 0
